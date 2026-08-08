@@ -227,6 +227,42 @@ app.delete("/api/:collection/:id", async (req, res) => {
     }
 });
 
+// UPDATE COMMENT FOR A SPECIFIC REPORT
+app.patch("/api/:collection/comment/:id", async (req, res) => {
+    try {
+        const collection = req.params.collection;
+        const { comment } = req.body;
+
+        if (!isValidCollection(collection)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid collection name"
+            });
+        }
+
+        const database = await getDB();
+        const result = await database
+            .collection(collection)
+            .updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $set: { comment: comment, comment_updated_at: new Date() } }
+            );
+
+        res.json({
+            success: true,
+            message: "Comment updated successfully",
+            result
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+});
+
 // Local environment ke liye listen karna (Vercel apne aap handle karega isko)
 if (process.env.NODE_ENV !== 'production') {
     const PORT = process.env.PORT || 3000;
