@@ -3,24 +3,27 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
-const Groq = require("groq-sdk"); // 1. Groq import kiya
+const Groq = require("groq-sdk"); 
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
+// MongoDB and Groq Clients
 const client = new MongoClient(process.env.MONGODB_URI);
-
-// 2. Groq client initialize kiya
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-let db;
+let db = null;
 
-// MongoDB Connection
-async function connectDB() {
-    await client.connect();
-    console.log("✅ MongoDB Connected");
+// Serverless-friendly MongoDB Connection
+async function getDB() {
+    if (!db) {
+        await client.connect();
+        db = client.db();
+        console.log("✅ MongoDB Connected");
+    }
+    return db;
 }
 
 // Collection name validation
@@ -40,38 +43,33 @@ app.post("/api/:collection", async (req, res) => {
             });
         }
 
-        // 3. Groq API ko prompt bhejna analysis ke liye
-        // Yahan aap prompt ko apne hisaab se change kar sakte ho
+        // Groq API ko prompt bhejna analysis ke liye
         const prompt = `Please analyze the following health report submission and provide a short summary or insights: ${JSON.stringify(req.body)}`;
         
         const chatCompletion = await groq.chat.completions.create({
-            messages: [
-                {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
-           model: "groq/compound",// Aap koi aur model bhi use kar sakte ho
+            messages: [{ role: "user", content: prompt }],
+            model: "groq/compound", 
         });
 
         const groqAnalysis = chatCompletion.choices[0]?.message?.content || "No analysis generated.";
 
-        // 4. Original data ke saath Groq ka analysis jodna
+        // Original data ke saath Groq ka analysis jodna
         const dataToSave = {
             ...req.body,
             ai_analysis: groqAnalysis,
             timestamp: new Date()
         };
 
-        // 5. Database mein save karna
-        const result = await db
+        // Database connect aur save karna
+        const database = await getDB();
+        const result = await database
             .collection(collection)
             .insertOne(dataToSave);
 
         res.status(201).json({
             success: true,
             insertedId: result.insertedId,
-            analysis: groqAnalysis // Postman/frontend me dekhne ke liye response me bhi bhej diya
+            analysis: groqAnalysis
         });
 
     } catch (err) {
@@ -95,7 +93,8 @@ app.get("/api/:collection", async (req, res) => {
             });
         }
 
-        const data = await db
+        const database = await getDB();
+        const data = await database
             .collection(collection)
             .find({})
             .toArray();
@@ -122,7 +121,8 @@ app.get("/api/:collection/:id", async (req, res) => {
             });
         }
 
-        const data = await db
+        const database = await getDB();
+        const data = await database
             .collection(collection)
             .findOne({
                 _id: new ObjectId(req.params.id)
@@ -150,7 +150,8 @@ app.patch("/api/:collection/:id", async (req, res) => {
             });
         }
 
-        const result = await db
+        const database = await getDB();
+        const result = await database
             .collection(collection)
             .updateOne(
                 {
@@ -183,7 +184,8 @@ app.delete("/api/:collection/:id", async (req, res) => {
             });
         }
 
-        const result = await db
+        const database = await getDB();
+        const result = await database
             .collection(collection)
             .deleteOne({
                 _id: new ObjectId(req.params.id)
@@ -199,12 +201,13 @@ app.delete("/api/:collection/:id", async (req, res) => {
     }
 });
 
-connectDB()
-    .then(() => {
-        app.listen(process.env.PORT, () => {
-            console.log(`🚀 Server running on port ${process.env.PORT}`);
-        });
-    })
-    .catch(err => {
-        console.error(err);
+// Local environment ke liye listen karna (Vercel apne aap handle karega isko)
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`🚀 Server running on port ${PORT}`);
     });
+}
+
+// Vercel serverless functions ke liye app export karna zaroori hai
+module.exports = app;
