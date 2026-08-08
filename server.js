@@ -31,7 +31,7 @@ function isValidCollection(name) {
     return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-// CREATE with Groq Analysis
+// CREATE with Improved AI Analysis
 app.post("/api/:collection", async (req, res) => {
     try {
         const collection = req.params.collection;
@@ -43,11 +43,37 @@ app.post("/api/:collection", async (req, res) => {
             });
         }
 
-        // Groq API ko prompt bhejna analysis ke liye
-        const prompt = `Please analyze the following health report submission and provide a short summary or insights: ${JSON.stringify(req.body)}`;
+        // 🌟 IMPROVED AI PROMPT SECTION 🌟
         
+        // 1. System Prompt: Directing the AI to be a smart health assistant
+        const systemPrompt = `You are an empathetic and smart health assistant. Your task is to analyze daily health logs provided in JSON format.
+        CRITICAL RULES:
+        - IGNORE all technical metadata (like formId, submissionId, URLs, timestamps, respondent ID).
+        - Focus ONLY on the actual health symptoms, feelings, or notes provided by the user.
+        - The user might write in Hindi, English, or Hinglish (e.g., "matha dard kar raha hai"). Understand it and reply in English.
+        
+        Please format your response in clear Markdown with these exact sections:
+        ### 📋 Quick Summary
+        (One clear sentence about how the user is feeling)
+        
+        ### 💡 Insights & Possible Causes
+        (Short logical reasoning based on the symptoms)
+        
+        ### 🌿 Gentle Suggestions
+        (1-2 quick home remedies or advice like rest/hydration)
+        
+        ### ⚠️ Note
+        (A standard 1-line medical disclaimer)`;
+
+        // 2. User Prompt: Passing the raw data
+        const userPrompt = `Here is the raw health log data. Please extract the symptoms and analyze:\n\n${JSON.stringify(req.body, null, 2)}`;
+        
+        // Groq API Call
         const chatCompletion = await groq.chat.completions.create({
-            messages: [{ role: "user", content: prompt }],
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt }
+            ],
             model: "groq/compound", 
         });
 
