@@ -20,7 +20,6 @@ let db;
 // MongoDB Connection
 async function connectDB() {
     await client.connect();
-    db = client.db();
     console.log("✅ MongoDB Connected");
 }
 
@@ -52,7 +51,7 @@ app.post("/api/:collection", async (req, res) => {
                     content: prompt,
                 },
             ],
-            model: "llama3-8b-8192", // Aap koi aur model bhi use kar sakte ho
+            model: "llama-3.1-70b-versatile", // Aap koi aur model bhi use kar sakte ho
         });
 
         const groqAnalysis = chatCompletion.choices[0]?.message?.content || "No analysis generated.";
