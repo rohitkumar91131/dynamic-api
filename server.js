@@ -51,7 +51,7 @@ app.post("/api/:collection", async (req, res) => {
                     content: prompt,
                 },
             ],
-            model: "llama-3.1-70b-versatile", // Aap koi aur model bhi use kar sakte ho
+           model: "groq/compound",// Aap koi aur model bhi use kar sakte ho
         });
 
         const groqAnalysis = chatCompletion.choices[0]?.message?.content || "No analysis generated.";
