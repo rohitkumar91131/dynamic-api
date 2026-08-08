@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
+const Groq = require("groq-sdk"); // 1. Groq import kiya
 
 const app = express();
 
@@ -11,15 +12,15 @@ app.use(express.json({ limit: "50mb" }));
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
+// 2. Groq client initialize kiya
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
 let db;
 
 // MongoDB Connection
 async function connectDB() {
     await client.connect();
-
-    // Database URI se automatically select ho jayega
     db = client.db();
-
     console.log("✅ MongoDB Connected");
 }
 
@@ -28,7 +29,7 @@ function isValidCollection(name) {
     return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-// CREATE
+// CREATE with Groq Analysis
 app.post("/api/:collection", async (req, res) => {
     try {
         const collection = req.params.collection;
@@ -40,16 +41,42 @@ app.post("/api/:collection", async (req, res) => {
             });
         }
 
+        // 3. Groq API ko prompt bhejna analysis ke liye
+        // Yahan aap prompt ko apne hisaab se change kar sakte ho
+        const prompt = `Please analyze the following health report submission and provide a short summary or insights: ${JSON.stringify(req.body)}`;
+        
+        const chatCompletion = await groq.chat.completions.create({
+            messages: [
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+            model: "llama3-8b-8192", // Aap koi aur model bhi use kar sakte ho
+        });
+
+        const groqAnalysis = chatCompletion.choices[0]?.message?.content || "No analysis generated.";
+
+        // 4. Original data ke saath Groq ka analysis jodna
+        const dataToSave = {
+            ...req.body,
+            ai_analysis: groqAnalysis,
+            timestamp: new Date()
+        };
+
+        // 5. Database mein save karna
         const result = await db
             .collection(collection)
-            .insertOne(req.body);
+            .insertOne(dataToSave);
 
         res.status(201).json({
             success: true,
-            insertedId: result.insertedId
+            insertedId: result.insertedId,
+            analysis: groqAnalysis // Postman/frontend me dekhne ke liye response me bhi bhej diya
         });
 
     } catch (err) {
+        console.error(err);
         res.status(500).json({
             success: false,
             message: err.message
