@@ -28,14 +28,14 @@ function isValidCollection(name) {
     return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-// 🌟 SMART AI TAGGING PROMPT (For initial creation) 🌟
+// 🌟 SMART AI TAGGING PROMPT 🌟
 const tagSystemPrompt = `You are a medical categorization AI. Read the user's daily health log (which might be in Hinglish/Hindi/English) and generate 1 to 3 highly relevant, concise medical/symptom hashtags. 
 CRITICAL RULES:
 - Output ONLY the hashtags separated by spaces (e.g., #Headache #Acidity #Fatigue).
 - If the log is about eating too much and bloating, output tags like #Bloating #Overeating.
 - Do NOT write any other text, no explanations, no formatting. Just the hashtags.`;
 
-// 🌟 DETAILED AI ANALYSIS PROMPT (For Modal) 🌟
+// 🌟 DETAILED AI ANALYSIS PROMPT 🌟
 const analysisSystemPrompt = `You are an empathetic and smart health assistant. Your task is to analyze daily health logs.
 CRITICAL RULES:
 - Focus ONLY on the actual health symptoms, feelings, or notes provided by the user.
@@ -61,7 +61,7 @@ function extractNotes(data) {
     return JSON.stringify(data);
 }
 
-// 1. CREATE ROUTE WITH AI TAGS
+// 1. CREATE ROUTE (Auto-Generates Tags & Analysis with Fail-Safe)
 app.post("/api/:collection", async (req, res) => {
     try {
         const collection = req.params.collection;
@@ -74,26 +74,50 @@ app.post("/api/:collection", async (req, res) => {
         const userPrompt = `Log: ${extractedText}`;
         
         let aiTags = "";
+        let aiAnalysis = "";
 
-        // AI CALL FOR TAGS
+        // 🌟 FAIL-SAFE AI CALLS (Runs Parallel) 🌟
         try {
-            const chatCompletion = await groq.chat.completions.create({
+            const tagsPromise = groq.chat.completions.create({
                 messages: [
                     { role: "system", content: tagSystemPrompt },
                     { role: "user", content: userPrompt }
                 ],
-                model: "llama3-8b-8192", // Fast model for simple tags
+                model: "llama3-8b-8192", // Fast model for tags
             });
-            aiTags = chatCompletion.choices[0]?.message?.content?.trim() || "";
+
+            const analysisPromise = groq.chat.completions.create({
+                messages: [
+                    { role: "system", content: analysisSystemPrompt },
+                    { role: "user", content: userPrompt }
+                ],
+                model: "llama3-70b-8192", // More capable model for detailed analysis
+            });
+
+            // Promise.allSettled ensures even if one fails, it doesn't break the whole app
+            const [tagsResult, analysisResult] = await Promise.allSettled([tagsPromise, analysisPromise]);
+
+            if (tagsResult.status === "fulfilled") {
+                aiTags = tagsResult.value.choices[0]?.message?.content?.trim() || "";
+            } else {
+                console.error("⚠️ Groq AI Tagging Failed:", tagsResult.reason?.message);
+            }
+
+            if (analysisResult.status === "fulfilled") {
+                aiAnalysis = analysisResult.value.choices[0]?.message?.content || "";
+            } else {
+                console.error("⚠️ Groq AI Analysis Failed:", analysisResult.reason?.message);
+            }
+
         } catch (aiError) {
-            console.error("⚠️ Groq AI Tagging Failed:", aiError.message);
+            console.error("⚠️ Critical AI API Failure (Data will still save):", aiError.message);
         }
 
-        // Save data with generated tags (ai_analysis left empty initially)
+        // 🌟 SAVE TO DATABASE (Even if AI completely fails) 🌟
         const dataToSave = {
             ...req.body,
             tags: aiTags,
-            ai_analysis: "",
+            ai_analysis: aiAnalysis,
             timestamp: new Date()
         };
 
@@ -103,16 +127,17 @@ app.post("/api/:collection", async (req, res) => {
         res.status(201).json({
             success: true,
             insertedId: result.insertedId,
-            tags: aiTags
+            tags: aiTags,
+            analysis_status: aiAnalysis ? "Generated" : "Failed"
         });
 
     } catch (err) {
-        console.error(err);
+        console.error("Database Error:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 2. 🌟 NEW: GENERATE DETAILED AI ANALYSIS (For Modal) 🌟
+// 2. MANUAL ANALYSIS GENERATOR (Fallback if auto fails)
 app.post("/api/:collection/analyze/:id", async (req, res) => {
     try {
         const collection = req.params.collection;
@@ -137,7 +162,7 @@ app.post("/api/:collection/analyze/:id", async (req, res) => {
                 { role: "system", content: analysisSystemPrompt },
                 { role: "user", content: userPrompt }
             ],
-            model: "groq/compound", // Or whatever model you prefer for long text
+            model: "llama3-70b-8192", 
         });
 
         const newAnalysis = chatCompletion.choices[0]?.message?.content || "";
@@ -208,7 +233,7 @@ app.patch("/api/:collection/:id", async (req, res) => {
     }
 });
 
-// 6. 🌟 NEW: UPDATE COMMENT (For Modal) 🌟
+// 6. UPDATE COMMENT (For Modal)
 app.patch("/api/:collection/comment/:id", async (req, res) => {
     try {
         const collection = req.params.collection;
