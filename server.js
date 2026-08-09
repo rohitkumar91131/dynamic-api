@@ -83,7 +83,7 @@ app.post("/api/:collection", async (req, res) => {
                     { role: "system", content: tagSystemPrompt },
                     { role: "user", content: userPrompt }
                 ],
-                model: "llama3-8b-8192", // Fast model for tags
+                model: "groq/compound", // Fast model for tags
             });
 
             const analysisPromise = groq.chat.completions.create({
@@ -91,7 +91,7 @@ app.post("/api/:collection", async (req, res) => {
                     { role: "system", content: analysisSystemPrompt },
                     { role: "user", content: userPrompt }
                 ],
-                model: "llama3-70b-8192", // More capable model for detailed analysis
+                model: "groq/compound", // More capable model for detailed analysis
             });
 
             // Promise.allSettled ensures even if one fails, it doesn't break the whole app
