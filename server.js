@@ -4,7 +4,6 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
 const Groq = require("groq-sdk"); 
-const groq = new Groq();
 
 const app = express();
 
