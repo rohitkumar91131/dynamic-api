@@ -83,7 +83,7 @@ app.post("/api/:collection", async (req, res) => {
                     { role: "system", content: tagSystemPrompt },
                     { role: "user", content: userPrompt }
                 ],
-                model: "groq/compound", // Fast model for tags
+                model: "llama-3.1-8b-instant", // 🌟 FIX: Updated to latest fast model
             });
 
             const analysisPromise = groq.chat.completions.create({
@@ -91,7 +91,7 @@ app.post("/api/:collection", async (req, res) => {
                     { role: "system", content: analysisSystemPrompt },
                     { role: "user", content: userPrompt }
                 ],
-                model: "groq/compound", // More capable model for detailed analysis
+                model: "llama-3.1-70b-versatile", // 🌟 FIX: Updated to latest smart model
             });
 
             // Promise.allSettled ensures even if one fails, it doesn't break the whole app
@@ -162,7 +162,7 @@ app.post("/api/:collection/analyze/:id", async (req, res) => {
                 { role: "system", content: analysisSystemPrompt },
                 { role: "user", content: userPrompt }
             ],
-            model: "llama3-70b-8192", 
+            model: "llama-3.1-70b-versatile", // 🌟 FIX: Updated to latest smart model
         });
 
         const newAnalysis = chatCompletion.choices[0]?.message?.content || "";
