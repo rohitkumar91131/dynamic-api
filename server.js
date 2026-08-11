@@ -33,7 +33,7 @@ const tagSystemPrompt = `You are a medical categorization AI. Read the user's da
 CRITICAL RULES:
 - Output ONLY the hashtags separated by spaces (e.g., #Headache #Acidity #Fatigue).
 - If the log is about eating too much and bloating, output tags like #Bloating #Overeating.
-- Do NOT write any other text, no explanations, no formatting. Just the hashtags.`;
+- Do NOT write any text, no explanations, no formatting. Just the hashtags.`;
 
 // 🌟 DETAILED AI ANALYSIS PROMPT 🌟
 const analysisSystemPrompt = `You are an empathetic and smart health assistant. Your task is to analyze daily health logs.
@@ -136,6 +136,36 @@ app.post("/api/:collection", async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+// ==========================================================
+// 1.5 NEW BURP API ROUTE (Added Without Altering Others)
+// ==========================================================
+app.post("/api/burp-journal/sync", async (req, res) => {
+    try {
+        const database = await getDB();
+        // Uses a strict collection name specifically for this app
+        const collection = "burp_journal_logs";
+        
+        const dataToSave = {
+            ...req.body, // Expects { events: [], states: [] }
+            sync_timestamp: new Date()
+        };
+
+        const result = await database.collection(collection).insertOne(dataToSave);
+
+        res.status(201).json({
+            success: true,
+            message: "Burp journal synced successfully",
+            insertedId: result.insertedId
+        });
+
+    } catch (err) {
+        console.error("Burp Sync Error:", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+// ==========================================================
+
 
 // 2. MANUAL ANALYSIS GENERATOR (Fallback if auto fails)
 app.post("/api/:collection/analyze/:id", async (req, res) => {
