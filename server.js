@@ -136,6 +136,9 @@ async function getDB() {
             await db.collection("api_keys").createIndex({ keyHash: 1 }, { unique: true, sparse: true });
             await db.collection("api_keys").createIndex({ key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
             await db.collection("api_keys").createIndex({ isActive: 1 });
+            await db.collection("invalid_api_attempts").createIndex({ timestamp: -1 });
+            await db.collection("invalid_api_attempts").createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
+            await db.collection("invalid_api_attempts").createIndex({ reason: 1 });
         } catch (e) { console.warn("Index ensure warn:", e.message); }
         // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
         try {
@@ -331,34 +334,67 @@ async function sendOtpEmail(toEmail, code) {
     return true;
 }
 
+// Helper to log invalid/expired attempts (non-blocking, masked)
+async function logInvalidAttempt(req, attemptedKey, reason, extra = {}) {
+    try {
+        const database = await getDB();
+        const masked = attemptedKey ? maskKey(String(attemptedKey).trim()) : "missing";
+        await database.collection("invalid_api_attempts").insertOne({
+            timestamp: new Date(),
+            ip: getClientIp(req),
+            method: req.method,
+            path: req.originalUrl || req.url,
+            attemptedKeyPreview: masked,
+            attemptedKeyHash: attemptedKey ? hashApiKey(String(attemptedKey).trim()).slice(0, 12) + "..." : null, // partial hash for debug, not full
+            reason, // invalid_format | missing | invalid | inactive | expired | error
+            userAgent: (req.headers["user-agent"] || "").slice(0, 300),
+            extra,
+        });
+        // Also console for Vercel logs
+        console.warn(`⚠️ invalid_api_attempt [${reason}] ip=${getClientIp(req)} preview=${masked} path=${req.originalUrl}`);
+    } catch (e) { /* never block */ }
+}
+
 // ==================== MIDDLEWARES ====================
 async function requireApiKey(req, res, next) {
     try {
         const headerKey = req.headers["x-api-key"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "") || req.query.api_key;
         if (!headerKey) {
-            return res.status(401).json({ success: false, message: "API key required. Send X-API-Key header or Authorization: Bearer <key>" });
+            logInvalidAttempt(req, null, "missing");
+            return res.status(401).json({ success: false, message: "API key required. Send X-API-Key header or Authorization: Bearer <key>", reason: "missing" });
         }
         const key = String(headerKey).trim();
-        if (key.length < 10 || key.length > 128) return res.status(401).json({ success: false, message: "Invalid API key format" });
+        if (key.length < 10 || key.length > 128) {
+            logInvalidAttempt(req, key, "invalid_format");
+            return res.status(401).json({ success: false, message: "Invalid API key format", reason: "invalid_format" });
+        }
 
         const hashed = hashApiKey(key);
         const database = await getDB();
-        // Support both new (keyHash) and legacy plaintext (key) during migration
+        // Support both new (keyHash) and legacy plaintext (key) during migration — first try active, then check why failed
         const doc = await database.collection("api_keys").findOne({
             $or: [{ keyHash: hashed }, { key: key }, { key: hashed }],
-            isActive: true
         });
-        if (!doc) return res.status(401).json({ success: false, message: "Invalid or inactive API key" });
-        if (doc.expiresAt && new Date(doc.expiresAt) < new Date()) {
-            return res.status(401).json({ success: false, message: "API key expired" });
+        if (!doc) {
+            logInvalidAttempt(req, key, "invalid");
+            return res.status(401).json({ success: false, message: "Invalid API key", reason: "invalid" });
         }
-        // update usage async (non-blocking)
+        if (!doc.isActive) {
+            logInvalidAttempt(req, key, "inactive", { keyId: String(doc._id), name: doc.name });
+            return res.status(401).json({ success: false, message: "API key inactive (revoked)", reason: "inactive" });
+        }
+        if (doc.expiresAt && new Date(doc.expiresAt) < new Date()) {
+            logInvalidAttempt(req, key, "expired", { keyId: String(doc._id), name: doc.name, expiresAt: doc.expiresAt });
+            return res.status(401).json({ success: false, message: "API key expired", reason: "expired", expiresAt: doc.expiresAt });
+        }
+        // success — update usage async (non-blocking)
         database.collection("api_keys").updateOne({ _id: doc._id }, { $set: { lastUsedAt: new Date() }, $inc: { usageCount: 1 } }).catch(()=>{});
         req.apiKeyDoc = doc;
         next();
     } catch (e) {
         console.error("requireApiKey error:", e);
-        res.status(500).json({ success: false, message: isProd ? "Internal server error" : e.message });
+        logInvalidAttempt(req, req.headers["x-api-key"] || "", "error", { error: e.message });
+        res.status(500).json({ success: false, message: isProd ? "Internal server error" : e.message, reason: "error" });
     }
 }
 
@@ -446,6 +482,12 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
 .modal-body{padding:20px;display:grid;gap:12px}
 .modal-key{background:#020617;border:1px solid #38bdf8;border-radius:10px;padding:14px;font-family:ui-monospace,Menlo,monospace;word-break:break-all;color:#38bdf8;font-size:13px;position:relative}
 .modal-warn{background:#451a03;border:1px solid #9a3412;color:#fed7aa;border-radius:8px;padding:10px;font-size:12px}
+.badge-expired{background:#7f1d1d;color:#fecaca;border:1px solid #991b1b;padding:2px 6px;border-radius:999px;font-size:10px}
+.badge-active{background:#14532d;color:#bbf7d0;border:1px solid #166534;padding:2px 6px;border-radius:999px;font-size:10px}
+.badge-inactive{background:#334155;color:#cbd5e1;border:1px solid #475569;padding:2px 6px;border-radius:999px;font-size:10px}
+.badge-invalid{background:#7c2d12;color:#fed7aa;border:1px solid #9a3412;padding:2px 6px;border-radius:999px;font-size:10px}
+.tab-active{border-color:#38bdf8 !important;box-shadow:0 0 0 2px rgba(56,189,248,.15)}
+.pagination{display:flex;gap:6px;align-items:center;margin-top:8px}
 </style>
 </head>
 <body>
@@ -494,8 +536,45 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
 
     <div class="panel">
       <h3>🔑 Your API Keys</h3>
+      <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+        <button class="sec small" onclick="filterKeys('all')" id="tabAll">All</button>
+        <button class="sec small" onclick="filterKeys('active')" id="tabActive">Active</button>
+        <button class="sec small" onclick="filterKeys('expired')" id="tabExpired">Expired</button>
+        <button class="sec small" onclick="filterKeys('inactive')" id="tabInactive">Inactive</button>
+        <span id="keyCounts" class="muted small" style="margin-left:auto"></span>
+      </div>
       <div id="keysBox" class="muted">Verify to load keys…</div>
     </div>
+
+    <div class="panel">
+      <h3>📊 Stats — All / Expired / Invalid</h3>
+      <div id="statsBox" class="muted small">Verify to load stats…</div>
+      <div class="row" style="margin-top:8px">
+        <button class="sec small" onclick="loadStats()">Refresh Stats</button>
+        <span class="muted small">Shows active/expired/inactive + invalid attempts by reason</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>⚠️ Invalid & Expired Attempts — All</h3>
+      <div class="row" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
+        <select id="reasonFilter" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:8px">
+          <option value="">All reasons</option>
+          <option value="invalid">invalid</option>
+          <option value="invalid_format">invalid_format</option>
+          <option value="missing">missing</option>
+          <option value="inactive">inactive</option>
+          <option value="expired">expired</option>
+        </select>
+        <button class="sec small" onclick="loadInvalid(1)">Filter</button>
+        <button class="sec small" onclick="loadInvalid(currentInvalidPage)">Refresh</button>
+        <button class="sec small" style="background:#7f1d1d;color:#fecaca;border:1px solid #991b1b" onclick="clearInvalid()">Clear All</button>
+        <span id="invalidInfo" class="muted small"></span>
+      </div>
+      <div id="invalidBox" class="muted small">Verify to load…</div>
+      <div id="expiredKeysBox" class="muted small" style="margin-top:12px"></div>
+    </div>
+
     <div class="muted small" style="text-align:center;padding-top:4px">Use header <code>X-API-Key: &lt;key&gt;</code> or <code>Authorization: Bearer &lt;key&gt;</code> for all <code>/api/*</code>. Base: <span id="baseUrl"></span></div>
   </div>
 </div>
@@ -550,7 +629,7 @@ qs('#btnVerify').onclick = async ()=>{
   const email = emailEl.value.trim(), code = codeEl.value.trim();
   if(!email||!code) return showAuth('Email + code required', false);
   showAuth('Verifying…', true);
-  try{ const j= await fetch(ADMIN_BASE+'/verify-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,code})}).then(r=>r.json()); if(!j.success) throw new Error(j.message); setToken(j.adminToken); showAuth('Verified! Token valid 60 min', true); setStatus('Verified as '+email+'<br>Token: <code class=key>'+j.adminToken.slice(0,16)+'...</code><br>Expires: '+new Date(j.expiresAt).toLocaleString(), true); loadKeys(); } catch(e){ showAuth(e.message,false); }
+  try{ const j= await fetch(ADMIN_BASE+'/verify-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,code})}).then(r=>r.json()); if(!j.success) throw new Error(j.message); setToken(j.adminToken); showAuth('Verified! Token valid 60 min', true); setStatus('Verified as '+email+'<br>Token: <code class=key>'+j.adminToken.slice(0,16)+'...</code><br>Expires: '+new Date(j.expiresAt).toLocaleString(), true); loadKeys(); loadStats(); loadInvalid(1); } catch(e){ showAuth(e.message,false); }
 };
 
 let lastCreatedKey = "";
@@ -580,39 +659,129 @@ qs('#btnCreate').onclick = async ()=>{
     const j = await api('/createapikey', {method:'POST', body:JSON.stringify({name, expiresAt})});
     createMsg.innerHTML = '<span class=ok>Created! Opening modal…</span>';
     openModal(j.key, j.name);
-    loadKeys();
+    loadKeys(); loadStats();
   } catch(e){ createMsg.innerHTML='<span class=err>'+e.message+'</span>'; }
 };
 
-qs('#btnRefresh').onclick = loadKeys;
-qs('#btnLogout').onclick = ()=>{ setToken(''); setStatus('Logged out. Token cleared.', false); keysBox.innerHTML='<span class=muted>Verify to load keys…</span>'; showAuth('Logged out', true); };
+qs('#btnRefresh').onclick = ()=>{ loadKeys(); loadStats(); };
+qs('#btnLogout').onclick = ()=>{ setToken(''); setStatus('Logged out. Token cleared.', false); keysBox.innerHTML='<span class=muted>Verify to load keys…</span>'; qs('#statsBox').innerHTML='<span class=muted>Verify to load stats…</span>'; qs('#invalidBox').innerHTML='<span class=muted>Verify to load…</span>'; showAuth('Logged out', true); };
+
+let allKeysCache = [];
+let currentKeyFilter = 'all';
+let currentInvalidPage = 1;
+
+function isExpired(k){ return k.expiresAt && new Date(k.expiresAt) <= new Date(); }
+function getKeyStatus(k){
+  if (!k.isActive) return 'inactive';
+  if (isExpired(k)) return 'expired';
+  return 'active';
+}
+function badgeForStatus(s){
+  if(s==='expired') return '<span class="badge-expired">expired</span>';
+  if(s==='active') return '<span class="badge-active">active</span>';
+  if(s==='inactive') return '<span class="badge-inactive">inactive</span>';
+  return '';
+}
+function renderKeys(){
+  if(!allKeysCache.length){ keysBox.innerHTML='<span class=muted>No keys yet. Create one above.</span>'; qs('#keyCounts').textContent=''; return; }
+  let filtered = allKeysCache;
+  if(currentKeyFilter!=='all') filtered = allKeysCache.filter(k=> getKeyStatus(k)===currentKeyFilter);
+  ['all','active','expired','inactive'].forEach(f=>{
+    const btn=qs('#tab'+f.charAt(0).toUpperCase()+f.slice(1));
+    if(btn) btn.classList.toggle('tab-active', f===currentKeyFilter);
+  });
+  const counts = {all:allKeysCache.length, active:allKeysCache.filter(k=>getKeyStatus(k)==='active').length, expired:allKeysCache.filter(k=>isExpired(k)).length, inactive:allKeysCache.filter(k=>!k.isActive).length};
+  qs('#keyCounts').textContent = 'All:' + counts.all + ' Active:' + counts.active + ' Expired:' + counts.expired + ' Inactive:' + counts.inactive + ' | Showing:' + filtered.length;
+  if(!filtered.length){ keysBox.innerHTML='<span class=muted>No '+currentKeyFilter+' keys</span>'; return; }
+  let html = '<table><tr><th>Name</th><th>Key (masked)</th><th>Status</th><th>Created</th><th>Uses</th><th></th></tr>';
+  filtered.forEach(k=>{
+    const created = new Date(k.createdAt).toLocaleDateString();
+    const preview = k.keyPreview || k.preview || (k.key ? (k.key.length===64 ? k.key.slice(0,8)+'••••••••'+k.key.slice(-4) : k.key.slice(0,8)+'••••••••'+k.key.slice(-4)) : '••••');
+    const status = getKeyStatus(k);
+    const badge = badgeForStatus(status);
+    const expiresInfo = k.expiresAt ? '<br><span class="muted small">exp:'+new Date(k.expiresAt).toLocaleDateString()+'</span>' : '';
+    const keyCell = '<code class=key title="Hashed - full key not retrievable">'+preview+'</code> <span class="muted small">(hashed)</span>';
+    html += '<tr><td>'+(k.name||'-')+'</td><td>'+keyCell+'</td><td>'+badge+expiresInfo+'</td><td>'+created+'</td><td>'+(k.usageCount||0)+'</td><td class=actions><button class="sec small" onclick="revoke(\''+k._id+'\')">delete</button></td></tr>';
+  });
+  html+='</table>';
+  keysBox.innerHTML = html;
+}
+function filterKeys(f){ currentKeyFilter=f; renderKeys(); }
 
 async function loadKeys(){
   if(!getToken()){ keysBox.innerHTML='<span class=err>Not verified. Enter OTP first.</span>'; return; }
   keysBox.innerHTML='<span class=muted>Loading…</span>';
   try{
     const j = await api('/keys');
-    if(!j.keys || !j.keys.length){ keysBox.innerHTML='<span class=muted>No keys yet. Create one above.</span>'; return; }
-    let html = '<table><tr><th>Name</th><th>Key (masked)</th><th>Created</th><th>Uses</th><th></th></tr>';
-    j.keys.forEach(k=>{
-      const created = new Date(k.createdAt).toLocaleDateString();
-      const preview = k.keyPreview || k.preview || (k.key ? (k.key.length===64 ? k.key.slice(0,8)+'••••••••'+k.key.slice(-4) : k.key.slice(0,8)+'••••••••'+k.key.slice(-4)) : '••••');
-      const isHashed = k.keyHash || (k.key && /^[a-f0-9]{64}$/.test(k.key));
-      const keyCell = isHashed ? '<code class=key title="Hashed - full key not retrievable">'+preview+'</code> <span class="muted small">(hashed)</span>' : '<code class=key>'+preview+'</code> <button class="sec small" onclick="navigator.clipboard.writeText(\''+(k.key||'')+'\')">copy</button>';
-      html += '<tr><td>'+(k.name||'-')+'</td><td>'+keyCell+'</td><td>'+created+'<br><span class=muted small>'+(k.isActive?'active':'inactive')+'</span></td><td>'+(k.usageCount||0)+'</td><td class=actions><button class="sec small" onclick="revoke(\''+k._id+'\')">delete</button></td></tr>';
-    });
-    html+='</table>';
-    keysBox.innerHTML = html;
-    setStatus('Loaded '+j.keys.length+' key(s). Token: '+(getToken().slice(0,16))+'...', true);
+    allKeysCache = j.keys || [];
+    renderKeys();
+    setStatus('Loaded '+allKeysCache.length+' key(s). Token: '+(getToken().slice(0,16))+'...', true);
   } catch(e){ keysBox.innerHTML='<span class=err>'+e.message+'</span>'; }
+}
+async function loadStats(){
+  if(!getToken()) return;
+  const box=qs('#statsBox');
+  box.innerHTML='<span class=muted>Loading stats…</span>';
+  try{
+    const j = await api('/stats');
+    const k=j.keys, inv=j.invalidAttempts;
+    box.innerHTML = \`
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <span class="badge-active">Active: \${k.active}</span>
+        <span class="badge-expired">Expired: \${k.expired}</span>
+        <span class="badge-inactive">Inactive: \${k.inactive}</span>
+        <span class="badge" style="background:#1e293b;border:1px solid #334155">Total keys: \${k.total}</span>
+        <span class="badge-invalid">Invalid attempts: \${inv.total}</span>
+      </div>
+      <div class="muted small" style="margin-top:8px">By reason: \${Object.entries(inv.byReason||{}).map(([r,c])=> r+':'+c).join(' • ') || 'none'} \${inv.lastAt ? '<br>Last invalid: '+new Date(inv.lastAt).toLocaleString() : ''}</div>
+    \`;
+  } catch(e){ box.innerHTML='<span class=err>'+e.message+'</span>'; }
+}
+async function loadInvalid(page=1){
+  if(!getToken()){ qs('#invalidBox').innerHTML='<span class=err>Not verified</span>'; return; }
+  currentInvalidPage=page;
+  const reason = qs('#reasonFilter').value;
+  const box=qs('#invalidBox'), info=qs('#invalidInfo'), expBox=qs('#expiredKeysBox');
+  box.innerHTML='<span class=muted>Loading…</span>';
+  try{
+    const j = await api('/invalid-attempts?limit=50&page='+page + (reason ? '&reason='+encodeURIComponent(reason) : ''));
+    info.textContent = \`Total:\${j.total} Page:\${j.page}/\${j.pages}\`;
+    if(!j.logs.length){ box.innerHTML='<span class=muted>No invalid attempts yet (all good!)</span>'; }
+    else {
+      let html='<table><tr><th>Time</th><th>Reason</th><th>Preview</th><th>IP</th><th>Path</th></tr>';
+      j.logs.forEach(l=>{
+        const t=new Date(l.timestamp).toLocaleString();
+        const badge = l.reason==='expired' ? 'badge-expired' : l.reason==='invalid' ? 'badge-invalid' : l.reason==='inactive' ? 'badge-inactive' : 'badge';
+        html+=\`<tr><td>\${t}</td><td><span class="\${badge}">\${l.reason}</span></td><td><code class=key>\${l.attemptedKeyPreview||'••••'}</code></td><td>\${l.ip}</td><td style="max-width:200px;overflow:auto">\${l.path||''}</td></tr>\`;
+      });
+      html+='</table>';
+      html+=\`<div class="pagination">\`;
+      if(j.page>1) html+=\`<button class="sec small" onclick="loadInvalid(\${j.page-1})">Prev</button>\`;
+      if(j.page<j.pages) html+=\`<button class="sec small" onclick="loadInvalid(\${j.page+1})">Next</button>\`;
+      html+=\`</div>\`;
+      box.innerHTML=html;
+    }
+    if(j.expiredKeys && j.expiredKeys.length){
+      let h='<div class="muted small" style="margin-top:8px"><b>Expired Keys (masked):</b></div><table><tr><th>Name</th><th>Preview</th><th>Expired At</th></tr>';
+      j.expiredKeys.forEach(k=>{
+        h+=\`<tr><td>\${k.name||'-'}</td><td><code class=key>\${k.keyPreview||''}</code></td><td>\${new Date(k.expiresAt).toLocaleString()} <span class="badge-expired">expired</span></td></tr>\`;
+      });
+      h+='</table>';
+      expBox.innerHTML=h;
+    } else expBox.innerHTML='<span class="muted small">No expired keys</span>';
+  } catch(e){ box.innerHTML='<span class=err>'+e.message+'</span>'; }
+}
+async function clearInvalid(){
+  if(!confirm('Clear all invalid attempt logs?')) return;
+  try{ const j=await api('/invalid-attempts', {method:'DELETE'}); alert('Cleared '+j.deleted+' logs'); loadInvalid(1); loadStats(); } catch(e){ alert(e.message); }
 }
 async function revoke(id){
   if(!confirm('Delete this API key? This cannot be undone.')) return;
-  try{ await api('/keys/'+id, {method:'DELETE'}); loadKeys(); } catch(e){ alert(e.message); }
+  try{ await api('/keys/'+id, {method:'DELETE'}); loadKeys(); loadStats(); } catch(e){ alert(e.message); }
 }
-window.revoke=revoke;
+window.revoke=revoke; window.filterKeys=filterKeys; window.loadInvalid=loadInvalid; window.clearInvalid=clearInvalid; window.loadStats=loadStats;
 // auto load if token exists
-if(getToken()){ setStatus('Token found in local storage, loading…', true); loadKeys(); }
+if(getToken()){ setStatus('Token found in local storage, loading…', true); loadKeys(); loadStats(); loadInvalid(1); }
 </script>
 </body>
 </html>`;
@@ -739,6 +908,60 @@ app.get(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, res
         expiresAt: k.expiresAt
     }));
     res.json({ success: true, keys: sanitized, hint: "POST to this endpoint with {name} to create" });
+});
+
+// === NEW: Stats + Invalid/Expired logs (all visible from admin) ===
+app.get(`${normalizedAdminBase}/stats`, requireAdminAuth, async (req, res) => {
+    try {
+        const database = await getDB();
+        const now = new Date();
+        const allKeys = await database.collection("api_keys").find({}).toArray();
+        const active = allKeys.filter(k => k.isActive && (!k.expiresAt || new Date(k.expiresAt) > now)).length;
+        const expired = allKeys.filter(k => k.expiresAt && new Date(k.expiresAt) <= now).length;
+        const inactive = allKeys.filter(k => !k.isActive).length;
+        const total = allKeys.length;
+        const invalidCount = await database.collection("invalid_api_attempts").countDocuments({});
+        const lastInvalid = await database.collection("invalid_api_attempts").find({}).sort({ timestamp: -1 }).limit(1).toArray();
+        const byReason = await database.collection("invalid_api_attempts").aggregate([
+            { $group: { _id: "$reason", count: { $sum: 1 } } }
+        ]).toArray();
+        res.json({
+            success: true,
+            keys: { total, active, expired, inactive },
+            invalidAttempts: {
+                total: invalidCount,
+                lastAt: lastInvalid[0]?.timestamp || null,
+                byReason: Object.fromEntries(byReason.map(r => [r._id, r.count]))
+            }
+        });
+    } catch (e) { sendError(res, e); }
+});
+
+app.get(`${normalizedAdminBase}/invalid-attempts`, requireAdminAuth, async (req, res) => {
+    try {
+        const database = await getDB();
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "50", 10)));
+        const page = Math.max(1, parseInt(req.query.page || "1", 10));
+        const skip = (page - 1) * limit;
+        const reason = req.query.reason ? String(req.query.reason).trim() : null;
+        const filter = reason ? { reason } : {};
+        const total = await database.collection("invalid_api_attempts").countDocuments(filter);
+        const logs = await database.collection("invalid_api_attempts").find(filter).sort({ timestamp: -1 }).skip(skip).limit(limit).toArray();
+        // also return expired keys list for "expired" tab convenience
+        const expiredKeys = await database.collection("api_keys").find({ expiresAt: { $lte: new Date() } }).sort({ expiresAt: -1 }).limit(50).toArray();
+        const sanitizedExpired = expiredKeys.map(k => ({
+            _id: k._id, name: k.name, keyPreview: k.keyPreview || maskKey(k.key || ""), expiresAt: k.expiresAt, isActive: k.isActive, usageCount: k.usageCount
+        }));
+        res.json({ success: true, total, page, limit, pages: Math.ceil(total / limit), logs, expiredKeys: sanitizedExpired });
+    } catch (e) { sendError(res, e); }
+});
+
+app.delete(`${normalizedAdminBase}/invalid-attempts`, requireAdminAuth, async (req, res) => {
+    try {
+        const database = await getDB();
+        const r = await database.collection("invalid_api_attempts").deleteMany({});
+        res.json({ success: true, deleted: r.deletedCount });
+    } catch (e) { sendError(res, e); }
 });
 
 // Create API key - uuid minimal + SHA256 hashing (hashed storage)
