@@ -133,9 +133,27 @@ async function getDB() {
         try {
             await db.collection("otps").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
             await db.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-            await db.collection("api_keys").createIndex({ key: 1 }, { unique: true });
+            await db.collection("api_keys").createIndex({ keyHash: 1 }, { unique: true, sparse: true });
+            await db.collection("api_keys").createIndex({ key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
             await db.collection("api_keys").createIndex({ isActive: 1 });
         } catch (e) { console.warn("Index ensure warn:", e.message); }
+        // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
+        try {
+            const col = db.collection("api_keys");
+            const plaintextKeys = await col.find({ key: { $regex: "^dyn_" } }).limit(50).toArray();
+            for (const doc of plaintextKeys) {
+                if (doc.key && !isHashedKey(doc.key) && !doc.keyHash) {
+                    const hashed = hashApiKey(doc.key);
+                    const preview = doc.keyPreview || maskKey(doc.key);
+                    // skip if hash already exists
+                    const exists = await col.findOne({ keyHash: hashed });
+                    if (exists) continue;
+                    await col.updateOne({ _id: doc._id }, { $set: { keyHash: hashed, key: hashed, keyPreview: preview, migratedAt: new Date() } });
+                    console.log(`🔐 auto-migrated key ${doc._id} ${preview}`);
+                }
+            }
+            if (plaintextKeys.length) console.log(`✅ auto-migration checked ${plaintextKeys.length} plaintext keys`);
+        } catch (e) { console.warn("auto-migrate warn:", e.message); }
     }
     return db;
 }
@@ -229,6 +247,17 @@ function stripMongoOperators(obj) {
 function getClientIp(req) {
     return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || req.socket.remoteAddress || "unknown";
 }
+function hashApiKey(key) {
+    return crypto.createHash("sha256").update(String(key)).digest("hex");
+}
+function isHashedKey(str) {
+    return typeof str === "string" && /^[a-f0-9]{64}$/.test(str);
+}
+function maskKey(key) {
+    const s = String(key);
+    if (s.length <= 12) return s.slice(0,4) + "****";
+    return s.slice(0, 8) + "••••••••" + s.slice(-4);
+}
 
 // Kira call with timeout + sanitization
 async function callKiraChat(messages, modelOverride) {
@@ -312,8 +341,13 @@ async function requireApiKey(req, res, next) {
         const key = String(headerKey).trim();
         if (key.length < 10 || key.length > 128) return res.status(401).json({ success: false, message: "Invalid API key format" });
 
+        const hashed = hashApiKey(key);
         const database = await getDB();
-        const doc = await database.collection("api_keys").findOne({ key, isActive: true });
+        // Support both new (keyHash) and legacy plaintext (key) during migration
+        const doc = await database.collection("api_keys").findOne({
+            $or: [{ keyHash: hashed }, { key: key }, { key: hashed }],
+            isActive: true
+        });
         if (!doc) return res.status(401).json({ success: false, message: "Invalid or inactive API key" });
         if (doc.expiresAt && new Date(doc.expiresAt) < new Date()) {
             return res.status(401).json({ success: false, message: "API key expired" });
@@ -404,6 +438,14 @@ th{color:#94a3b8;font-weight:600;font-size:11px;text-transform:uppercase;letter-
 .actions{display:flex;gap:6px}
 .small{font-size:11px}
 hr{border:none;border-top:1px solid #1e293b;margin:0}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:9999;padding:20px}
+.modal.open{display:flex}
+.modal-card{background:#0f172a;border:1px solid #334155;border-radius:16px;max-width:520px;width:100%;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.7)}
+.modal-hdr{padding:16px 20px;border-bottom:1px solid #1e293b;display:flex;justify-content:space-between;align-items:center}
+.modal-hdr h3{margin:0;font-size:14px;color:#f8fafc}
+.modal-body{padding:20px;display:grid;gap:12px}
+.modal-key{background:#020617;border:1px solid #38bdf8;border-radius:10px;padding:14px;font-family:ui-monospace,Menlo,monospace;word-break:break-all;color:#38bdf8;font-size:13px;position:relative}
+.modal-warn{background:#451a03;border:1px solid #9a3412;color:#fed7aa;border-radius:8px;padding:10px;font-size:12px}
 </style>
 </head>
 <body>
@@ -438,7 +480,7 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
           <button id="btnCreate">Create UUID Key</button>
         </div>
         <div id="createMsg"></div>
-        <p class="muted small">Keys are UUID-based. Store securely – you can still view them here anytime (personal use).</p>
+        <p class="muted small">Hashed (SHA-256) storage — full key shown <b>only once in modal</b>. Copy before closing!</p>
       </div>
       <div class="panel">
         <h3>Status</h3>
@@ -457,6 +499,27 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
     <div class="muted small" style="text-align:center;padding-top:4px">Use header <code>X-API-Key: &lt;key&gt;</code> or <code>Authorization: Bearer &lt;key&gt;</code> for all <code>/api/*</code>. Base: <span id="baseUrl"></span></div>
   </div>
 </div>
+
+<!-- Copy Modal -->
+<div id="keyModal" class="modal" onclick="if(event.target===this) closeModal()">
+  <div class="modal-card">
+    <div class="modal-hdr">
+      <h3>🔑 API Key Created</h3>
+      <button class="sec small" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-warn">⚠️ Copy now — this key is <b>hashed (SHA-256)</b> and will never be shown again. Store securely!</div>
+      <div id="modalKeyName" class="muted small"></div>
+      <div id="modalKeyValue" class="modal-key"></div>
+      <div class="row">
+        <button id="btnCopyModal" onclick="copyModalKey()">📋 Copy Key</button>
+        <button class="sec" onclick="closeModal()">Done</button>
+        <span id="copyMsg" class="muted small"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const ADMIN_BASE = location.pathname.replace(/\\/$/,'') || "${normalizedAdminBase}";
 const qs = s=>document.querySelector(s);
@@ -490,12 +553,35 @@ qs('#btnVerify').onclick = async ()=>{
   try{ const j= await fetch(ADMIN_BASE+'/verify-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,code})}).then(r=>r.json()); if(!j.success) throw new Error(j.message); setToken(j.adminToken); showAuth('Verified! Token valid 60 min', true); setStatus('Verified as '+email+'<br>Token: <code class=key>'+j.adminToken.slice(0,16)+'...</code><br>Expires: '+new Date(j.expiresAt).toLocaleString(), true); loadKeys(); } catch(e){ showAuth(e.message,false); }
 };
 
+let lastCreatedKey = "";
+function openModal(key, name){
+  lastCreatedKey = key;
+  qs('#modalKeyName').textContent = name ? 'Name: ' + name : '';
+  qs('#modalKeyValue').textContent = key;
+  qs('#copyMsg').textContent = '';
+  qs('#keyModal').classList.add('open');
+}
+function closeModal(){ qs('#keyModal').classList.remove('open'); }
+function copyModalKey(){
+  if(!lastCreatedKey) return;
+  navigator.clipboard.writeText(lastCreatedKey).then(()=>{
+    qs('#copyMsg').textContent='Copied!'; qs('#copyMsg').className='ok small';
+    setTimeout(()=> qs('#copyMsg').textContent='', 1500);
+  }).catch(()=>{ qs('#copyMsg').textContent='Copy failed, select manually'; });
+}
+window.closeModal=closeModal; window.copyModalKey=copyModalKey;
+
 qs('#btnCreate').onclick = async ()=>{
   const name = qs('#keyName').value.trim() || 'Key '+new Date().toLocaleString();
   const expiresAt = qs('#keyExpiry').value ? new Date(qs('#keyExpiry').value).toISOString() : null;
   if(!getToken()) return createMsg.innerHTML='<span class=err>Verify OTP first</span>';
   createMsg.innerHTML='<span class=muted>Creating…</span>';
-  try{ const j = await api('/createapikey', {method:'POST', body:JSON.stringify({name, expiresAt})}); createMsg.innerHTML = '<span class=ok>Created: <code class=key>'+j.key+'</code></span><br><span class=muted small>ID: '+j.id+' • Name: '+j.name+'</span><br><button class=sec small onclick="navigator.clipboard.writeText(\\''+j.key+'\\')">Copy Key</button>'; loadKeys(); } catch(e){ createMsg.innerHTML='<span class=err>'+e.message+'</span>'; }
+  try{
+    const j = await api('/createapikey', {method:'POST', body:JSON.stringify({name, expiresAt})});
+    createMsg.innerHTML = '<span class=ok>Created! Opening modal…</span>';
+    openModal(j.key, j.name);
+    loadKeys();
+  } catch(e){ createMsg.innerHTML='<span class=err>'+e.message+'</span>'; }
 };
 
 qs('#btnRefresh').onclick = loadKeys;
@@ -507,11 +593,13 @@ async function loadKeys(){
   try{
     const j = await api('/keys');
     if(!j.keys || !j.keys.length){ keysBox.innerHTML='<span class=muted>No keys yet. Create one above.</span>'; return; }
-    let html = '<table><tr><th>Name</th><th>Key</th><th>Created</th><th>Uses</th><th></th></tr>';
+    let html = '<table><tr><th>Name</th><th>Key (masked)</th><th>Created</th><th>Uses</th><th></th></tr>';
     j.keys.forEach(k=>{
       const created = new Date(k.createdAt).toLocaleDateString();
-      const key = k.key;
-      html += '<tr><td>'+(k.name||'-')+'</td><td><code class=key>'+key+'</code> <button class="sec small" onclick="navigator.clipboard.writeText(\\''+key+'\\')">copy</button></td><td>'+created+'<br><span class=muted small>'+(k.isActive?'active':'inactive')+'</span></td><td>'+(k.usageCount||0)+'</td><td class=actions><button class="sec small" onclick="revoke(\\''+k._id+'\\')">delete</button></td></tr>';
+      const preview = k.keyPreview || k.preview || (k.key ? (k.key.length===64 ? k.key.slice(0,8)+'••••••••'+k.key.slice(-4) : k.key.slice(0,8)+'••••••••'+k.key.slice(-4)) : '••••');
+      const isHashed = k.keyHash || (k.key && /^[a-f0-9]{64}$/.test(k.key));
+      const keyCell = isHashed ? '<code class=key title="Hashed - full key not retrievable">'+preview+'</code> <span class="muted small">(hashed)</span>' : '<code class=key>'+preview+'</code> <button class="sec small" onclick="navigator.clipboard.writeText(\''+(k.key||'')+'\')">copy</button>';
+      html += '<tr><td>'+(k.name||'-')+'</td><td>'+keyCell+'</td><td>'+created+'<br><span class=muted small>'+(k.isActive?'active':'inactive')+'</span></td><td>'+(k.usageCount||0)+'</td><td class=actions><button class="sec small" onclick="revoke(\''+k._id+'\')">delete</button></td></tr>';
     });
     html+='</table>';
     keysBox.innerHTML = html;
@@ -611,22 +699,49 @@ app.post(`${normalizedAdminBase}/verify-otp`, async (req, res) => {
     } catch (e) { sendError(res, e, "Verification failed"); }
 });
 
-// Admin API - list keys
+// Admin API - list keys (masked, never expose plaintext hash as copyable)
 app.get(`${normalizedAdminBase}/keys`, requireAdminAuth, async (req, res) => {
     try {
         const database = await getDB();
         const keys = await database.collection("api_keys").find({}).sort({ createdAt: -1 }).limit(100).toArray();
-        res.json({ success: true, keys });
+        // Sanitize: ensure preview exists, don't leak full plaintext (already hashed, but mask hash too)
+        const sanitized = keys.map(k => ({
+            _id: k._id,
+            name: k.name,
+            keyPreview: k.keyPreview || (k.key ? maskKey(k.key) : "••••"),
+            keyHash: k.keyHash || (isHashedKey(k.key) ? k.key : undefined),
+            // keep raw `key` masked for legacy UI that expects k.key — we send preview there too if hashed
+            key: isHashedKey(k.key) ? (k.keyPreview || maskKey(k.key)) : maskKey(k.key || ""),
+            email: k.email,
+            createdAt: k.createdAt,
+            lastUsedAt: k.lastUsedAt,
+            usageCount: k.usageCount,
+            isActive: k.isActive,
+            expiresAt: k.expiresAt
+        }));
+        res.json({ success: true, keys: sanitized });
     } catch (e) { sendError(res, e); }
 });
 app.get(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, res) => {
-    // convenience GET -> list
+    // convenience GET -> list (same sanitized)
     const database = await getDB();
     const keys = await database.collection("api_keys").find({}).sort({ createdAt: -1 }).limit(100).toArray();
-    res.json({ success: true, keys, hint: "POST to this endpoint with {name} to create" });
+    const sanitized = keys.map(k => ({
+        _id: k._id,
+        name: k.name,
+        keyPreview: k.keyPreview || (k.key ? maskKey(k.key) : "••••"),
+        key: isHashedKey(k.key) ? (k.keyPreview || maskKey(k.key)) : maskKey(k.key || ""),
+        email: k.email,
+        createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt,
+        usageCount: k.usageCount,
+        isActive: k.isActive,
+        expiresAt: k.expiresAt
+    }));
+    res.json({ success: true, keys: sanitized, hint: "POST to this endpoint with {name} to create" });
 });
 
-// Create API key - uuid minimal
+// Create API key - uuid minimal + SHA256 hashing (hashed storage)
 app.post(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, res) => {
     try {
         const name = sanitizeString(String(req.body?.name || `Key ${new Date().toLocaleDateString()}`), 100) || `Key ${Date.now()}`;
@@ -635,13 +750,17 @@ app.post(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, re
             const d = new Date(req.body.expiresAt);
             if (!isNaN(d.getTime()) && d > new Date()) expiresAt = d;
         }
-        // Minimal UUID key: dyn_ + uuid without dashes + 8 hex
+        // Minimal UUID key: dyn_ + uuid without dashes + 8 hex (plaintext shown only once)
         const uuidPart = uuidv4().replace(/-/g, "");
         const rand = crypto.randomBytes(4).toString("hex");
-        const key = `dyn_${uuidPart}${rand}`; // e.g., dyn_550e8400e29b41d4a716446655440000a1b2
+        const key = `dyn_${uuidPart}${rand}`;
+        const keyHash = hashApiKey(key);
+        const keyPreview = maskKey(key);
         const database = await getDB();
         const doc = {
-            key,
+            keyHash,
+            key: keyHash, // keep `key` as hash for legacy unique index, plaintext never stored
+            keyPreview,
             name,
             email: req.adminEmail,
             createdAt: new Date(),
@@ -651,23 +770,22 @@ app.post(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, re
             expiresAt
         };
         const result = await database.collection("api_keys").insertOne(doc);
-        res.status(201).json({ success: true, message: "API key created", key, id: result.insertedId, name, expiresAt });
+        // Return plaintext ONLY once for modal copy — never stored
+        res.status(201).json({ success: true, message: "API key created — copy now, hashed storage", key, keyPreview, keyHash, id: result.insertedId, name, expiresAt });
     } catch (e) {
         if (e.code === 11000) return res.status(409).json({ success: false, message: "Key collision, retry" });
         sendError(res, e);
     }
 });
-// alias POST /keys
+// alias POST /keys (same as /createapikey, hashed)
 app.post(`${normalizedAdminBase}/keys`, requireAdminAuth, async (req, res) => {
-    // reuse same handler
-    req.url = `${normalizedAdminBase}/createapikey`;
-    app._router.handle(req, res, () => {});
-    // fallback simple create
     try {
         const name = sanitizeString(String(req.body?.name || `Key ${new Date().toLocaleDateString()}`), 100) || `Key ${Date.now()}`;
         const uuidPart = uuidv4().replace(/-/g, "");
         const rand = crypto.randomBytes(4).toString("hex");
         const key = `dyn_${uuidPart}${rand}`;
+        const keyHash = hashApiKey(key);
+        const keyPreview = maskKey(key);
         const database = await getDB();
         let expiresAt = null;
         if (req.body?.expiresAt) {
@@ -675,10 +793,13 @@ app.post(`${normalizedAdminBase}/keys`, requireAdminAuth, async (req, res) => {
             if (!isNaN(d.getTime()) && d > new Date()) expiresAt = d;
         }
         const result = await database.collection("api_keys").insertOne({
-            key, name, email: req.adminEmail, createdAt: new Date(), lastUsedAt: null, usageCount: 0, isActive: true, expiresAt
+            keyHash, key: keyHash, keyPreview, name, email: req.adminEmail, createdAt: new Date(), lastUsedAt: null, usageCount: 0, isActive: true, expiresAt
         });
-        res.status(201).json({ success: true, key, id: result.insertedId, name, expiresAt });
-    } catch (e) { /* already handled */ }
+        res.status(201).json({ success: true, message: "API key created — copy now, hashed storage", key, keyPreview, keyHash, id: result.insertedId, name, expiresAt });
+    } catch (e) {
+        if (e.code === 11000) return res.status(409).json({ success: false, message: "Key collision, retry" });
+        sendError(res, e);
+    }
 });
 
 app.delete(`${normalizedAdminBase}/keys/:id`, requireAdminAuth, async (req, res) => {

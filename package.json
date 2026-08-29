@@ -5,7 +5,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "migrate:keys": "node scripts/migrate-keys.js",
+    "prestart": "node scripts/migrate-keys.js || true",
+    "postinstall": "node scripts/migrate-keys.js || true",
+    "build": "node scripts/migrate-keys.js || true"
   },
   "dependencies": {
     "cors": "^2.8.5",
