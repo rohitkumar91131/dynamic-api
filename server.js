@@ -65,7 +65,7 @@ if (CORS_ORIGIN) {
         credentials: true
     };
 }
-app.use(cors(corsOptions));
+app.use(cors());
 
 // Body limit reduced from 50mb -> 1mb to prevent DoS
 app.use(express.json({ limit: "1mb" }));
