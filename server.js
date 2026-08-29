@@ -501,11 +501,11 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
       <h3>1. Verify via Gmail OTP (SMTP)</h3>
       <div class="row" style="margin-bottom:8px">
         <input id="email" placeholder="admin email (ADMIN_EMAIL)" autocomplete="email"/>
-        <button id="btnSend">Send OTP</button>
+        <button type="button" id="btnSend">Send OTP</button>
       </div>
       <div class="row">
         <input id="code" placeholder="6-digit code" maxlength="6" style="max-width:160px"/>
-        <button id="btnVerify">Verify</button>
+        <button type="button" id="btnVerify">Verify</button>
         <span id="authMsg" class="muted"></span>
       </div>
       <p class="muted small" style="margin:8px 0 0">OTP sent via SMTP Gmail to your ADMIN_EMAIL. Code expires in 10 min. After verify you get 60-min admin token stored locally.</p>
@@ -519,7 +519,7 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
         </div>
         <div class="row" style="margin-bottom:8px">
           <input id="keyExpiry" type="date" title="Expiry optional"/>
-          <button id="btnCreate">Create UUID Key</button>
+          <button type="button" id="btnCreate">Create UUID Key</button>
         </div>
         <div id="createMsg"></div>
         <p class="muted small">Hashed (SHA-256) storage — full key shown <b>only once in modal</b>. Copy before closing!</p>
@@ -528,8 +528,8 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
         <h3>Status</h3>
         <div id="statusBox" class="muted small">Not verified. Send OTP first.</div>
         <div style="margin-top:10px" class="row">
-          <button class="sec small" id="btnRefresh">Refresh Keys</button>
-          <button class="sec small" id="btnLogout">Logout</button>
+          <button type="button" class="sec small" id="btnRefresh">Refresh Keys</button>
+          <button type="button" class="sec small" id="btnLogout">Logout</button>
         </div>
       </div>
     </div>
@@ -600,10 +600,15 @@ hr{border:none;border-top:1px solid #1e293b;margin:0}
 </div>
 
 <script>
-const ADMIN_BASE = location.pathname.replace(/\\/$/,'') || "${normalizedAdminBase}";
+const ADMIN_BASE = "${normalizedAdminBase}";
+console.log("Admin base:", ADMIN_BASE);
 const qs = s=>document.querySelector(s);
-const emailEl=qs('#email'), codeEl=qs('#code'), authMsg=qs('#authMsg'), statusBox=qs('#statusBox'), keysBox=qs('#keysBox'), createMsg=qs('#createMsg');
-qs('#baseUrl').textContent = location.origin;
+let emailEl, codeEl, authMsg, statusBox, keysBox, createMsg;
+function initEls(){
+  emailEl=qs('#email'); codeEl=qs('#code'); authMsg=qs('#authMsg'); statusBox=qs('#statusBox'); keysBox=qs('#keysBox'); createMsg=qs('#createMsg');
+  const baseUrlEl=qs('#baseUrl'); if(baseUrlEl) baseUrlEl.textContent = location.origin;
+}
+initEls();
 function getToken(){ return localStorage.getItem('admin_token')||''; }
 function setToken(t){ if(t) localStorage.setItem('admin_token', t); else localStorage.removeItem('admin_token'); }
 function setStatus(msg, ok){ statusBox.innerHTML = msg; statusBox.className = ok ? 'ok small' : 'muted small'; }
@@ -618,19 +623,34 @@ async function api(path, opts={}){
   return j;
 }
 
-qs('#btnSend').onclick = async ()=>{
-  const email = emailEl.value.trim();
+function attachBtn(id, handler){
+  const el = qs('#'+id);
+  if(!el){ console.error('Missing button', id); return; }
+  el.addEventListener('click', handler);
+}
+attachBtn('btnSend', async ()=>{
+  if(!emailEl) initEls();
+  const email = (emailEl?.value||'').trim();
   if(!email) return showAuth('Enter email', false);
   showAuth('Sending…', true);
-  try{ const j= await fetch(ADMIN_BASE+'/request-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})}).then(r=>r.json()); if(!j.success) throw new Error(j.message); showAuth('OTP sent to '+email+' (check Gmail/spam). Dev: check server console if SMTP not set.', true); setStatus('OTP sent to '+email+'. Enter code.', true); } catch(e){ showAuth(e.message,false); }
-};
+  console.log('Sending OTP to', email, 'via', ADMIN_BASE+'/request-otp');
+  try{
+    const r = await fetch(ADMIN_BASE+'/request-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
+    const j = await r.json().catch(()=>({success:false,message:'Invalid JSON '+r.status}));
+    console.log('OTP response', r.status, j);
+    if(!j.success) throw new Error(j.message || ('HTTP '+r.status));
+    showAuth('OTP sent to '+email+' (check Gmail/spam). Dev: check server console if SMTP not set.', true);
+    setStatus('OTP sent to '+email+'. Enter code.', true);
+  } catch(e){ console.error('OTP send failed', e); showAuth(e.message||String(e),false); }
+});
 
-qs('#btnVerify').onclick = async ()=>{
-  const email = emailEl.value.trim(), code = codeEl.value.trim();
+attachBtn('btnVerify', async ()=>{
+  if(!emailEl) initEls();
+  const email = (emailEl?.value||'').trim(), code = (codeEl?.value||'').trim();
   if(!email||!code) return showAuth('Email + code required', false);
   showAuth('Verifying…', true);
   try{ const j= await fetch(ADMIN_BASE+'/verify-otp',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,code})}).then(r=>r.json()); if(!j.success) throw new Error(j.message); setToken(j.adminToken); showAuth('Verified! Token valid 60 min', true); setStatus('Verified as '+email+'<br>Token: <code class=key>'+j.adminToken.slice(0,16)+'...</code><br>Expires: '+new Date(j.expiresAt).toLocaleString(), true); loadKeys(); loadStats(); loadInvalid(1); } catch(e){ showAuth(e.message,false); }
-};
+});
 
 let lastCreatedKey = "";
 function openModal(key, name){
