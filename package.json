@@ -1,7 +1,7 @@
 {
   "name": "dynamic-api",
-  "version": "1.0.0",
-  "description": "Generic Dynamic MongoDB CRUD API",
+  "version": "2.0.0",
+  "description": "Secure Dynamic MongoDB CRUD API with Kira AI & API-Key + SMTP OTP Auth",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,8 +11,14 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
-    "groq-sdk": "^1.5.0",
-    "mongodb": "^6.18.0"
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "hpp": "^0.2.3",
+    "mongodb": "^6.18.0",
+    "nodemailer": "^9.0.6",
+    "openai": "^4.104.0",
+    "uuid": "^11.1.0",
+    "xss": "^1.0.15"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
