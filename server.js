@@ -1595,8 +1595,12 @@ app.patch("/api/:collection/comment/:id", requireApiKey, apiLimiter, async (req,
     } catch (err) { sendError(res, err); }
 });
 
-// 3. READ ALL with pagination (fixes DoS)
-app.get("/api/:collection", requireApiKey, apiLimiter, async (req, res) => {
+// 3. READ ALL with pagination (fixes DoS) - hourlyhealthreport is public for Health Journal (hobby), others need API key
+app.get("/api/:collection", globalLimiter, async (req, res, next) => {
+    const colCheck = req.params.collection;
+    if (colCheck === "hourlyhealthreport") return next();
+    return requireApiKey(req, res, next);
+}, apiLimiter, async (req, res) => {
     try {
         const collection = req.params.collection;
         if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection name" });
@@ -1620,8 +1624,12 @@ app.get("/api/:collection", requireApiKey, apiLimiter, async (req, res) => {
     } catch (err) { sendError(res, err); }
 });
 
-// 4. READ ONE
-app.get("/api/:collection/:id", requireApiKey, apiLimiter, async (req, res) => {
+// 4. READ ONE - hourlyhealthreport public, others protected
+app.get("/api/:collection/:id", globalLimiter, async (req, res, next) => {
+    const colCheck = req.params.collection;
+    if (colCheck === "hourlyhealthreport") return next();
+    return requireApiKey(req, res, next);
+}, apiLimiter, async (req, res) => {
     try {
         const collection = req.params.collection;
         const id = req.params.id;
