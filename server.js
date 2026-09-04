@@ -1550,21 +1550,28 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
         const database = await getDB();
         const result = await database.collection(collection).insertOne(dataToSave);
 
+        // Generate 25kb webp + Telegram at NEW ENTRY time (await, not fire-and-forget - Vercel kills background)
+        let thumbResult = null;
+        try {
+            // 4s timeout so Tally webhook doesn't hang
+            thumbResult = await Promise.race([
+                processThumbnailsForDoc(collection, result.insertedId, sanitizedData),
+                new Promise((_, rej) => setTimeout(() => rej(new Error("thumb timeout 4s")), 4000))
+            ]);
+            if (thumbResult?.processed) console.log(`✅ thumbnails at insert for ${collection}/${result.insertedId}:`, thumbResult.results);
+        } catch (e) {
+            console.warn(`⚠️ thumb at insert failed/timeout for ${result.insertedId}:`, e.message);
+            // fallback: fire-and-forget for remaining (if timeout)
+            setImmediate(() => processThumbnailsForDoc(collection, result.insertedId, sanitizedData).catch(()=>{}));
+        }
+
         res.status(201).json({
             success: true,
             insertedId: result.insertedId,
             tags: aiTags,
             ai_analysis: aiAnalysis ? "Generated" : (KIRA_API_KEY ? "Failed" : "Skipped (no KIRA_API_KEY)"),
-            modelUsed: tagModel
-        });
-
-        // Fire-and-forget 25kb webp thumbnail + Telegram upload (non-blocking)
-        const insertedId = result.insertedId;
-        const dataForThumb = sanitizedData;
-        setImmediate(() => {
-            processThumbnailsForDoc(collection, insertedId, dataForThumb)
-                .then(r => { if (r.processed) console.log(`✅ thumbnails done for ${collection}/${insertedId}:`, r.results); })
-                .catch(e => console.warn("thumbnail bg error:", e.message));
+            modelUsed: tagModel,
+            thumbnails: thumbResult?.results || []
         });
     } catch (err) { sendError(res, err, "Failed to create", 500); }
 });
