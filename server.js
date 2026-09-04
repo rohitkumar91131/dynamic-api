@@ -1542,7 +1542,8 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
             tags: aiTags,
             ai_analysis: aiAnalysis,
             timestamp: new Date(),
-            createdByKey: String(req.apiKeyDoc._id),
+            createdByKey: req.apiKeyDoc ? String(req.apiKeyDoc._id) : (req.body?.eventType ? "tally-webhook" : "public"),
+            createdBy: req.apiKeyDoc ? req.apiKeyDoc.name : "public",
             // keep original requested collection for audit
         };
 
