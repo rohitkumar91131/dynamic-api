@@ -1189,6 +1189,46 @@ app.delete(`${normalizedAdminBase}/invalid-attempts`, requireAdminAuth, async (r
     } catch (e) { sendError(res, e); }
 });
 
+// Backfill thumbnails for existing docs (admin only) - handles old images without thumbs
+app.post(`${normalizedAdminBase}/backfill-thumbnails`, requireAdminAuth, async (req, res) => {
+    try {
+        const collection = sanitizeString(String(req.body?.collection || "hourlyhealthreport"), 64) || "hourlyhealthreport";
+        if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection" });
+        const limit = Math.min(200, Math.max(1, parseInt(req.body?.limit || "20", 10)));
+        const dryRun = !!req.body?.dryRun;
+        const database = await getDB();
+        // Find docs that have FILE_UPLOAD but no thumbnails yet (or thumbnails empty)
+        const candidates = await database.collection(collection).find({
+            $and: [
+                { "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } } },
+                { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ] }
+            ]
+        }).sort({ createdAt: -1 }).limit(limit).toArray();
+        if (dryRun) {
+            return res.json({ success: true, dryRun: true, found: candidates.length, sampleIds: candidates.slice(0,5).map(c=>c._id) });
+        }
+        let processed = 0, failed = 0, details = [];
+        for (const doc of candidates) {
+            try {
+                const r = await processThumbnailsForDoc(collection, doc._id, doc.data);
+                processed++;
+                details.push({ id: doc._id, processed: r.processed, results: r.results });
+            } catch (e) {
+                failed++;
+                details.push({ id: doc._id, error: e.message });
+            }
+            // small delay to avoid hammering
+            await new Promise(r=>setTimeout(r, 300));
+        }
+        // also count remaining
+        const remaining = await database.collection(collection).countDocuments({
+            "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } },
+            $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ]
+        });
+        res.json({ success: true, processed, failed, remaining, details: details.slice(0,20) });
+    } catch (e) { sendError(res, e); }
+});
+
 // Create API key - uuid minimal + SHA256 hashing (hashed storage)
 app.post(`${normalizedAdminBase}/createapikey`, requireAdminAuth, async (req, res) => {
     try {
