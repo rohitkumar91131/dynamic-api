@@ -1463,8 +1463,21 @@ function parsePagination(req) {
     return { limit, skip, sort, page };
 }
 
-// 1. CREATE with Kira auto-tag+analysis (dynamic, sanitized, mass-assignment fixed)
-app.post("/api/:collection", requireApiKey, apiLimiter, async (req, res) => {
+// 1. CREATE with Kira auto-tag+analysis (dynamic, sanitized, mass-assignment fixed) - hourlyhealthreport is public for Tally webhook (hobby)
+app.post("/api/:collection", globalLimiter, async (req, res, next) => {
+    const colCheck = req.params.collection;
+    if (colCheck === "hourlyhealthreport") {
+        // Try API key if provided (query/header), but allow Tally webhook without key (has eventType/data.fields)
+        const hasKey = req.headers["x-api-key"] || req.headers["authorization"] || req.query.api_key;
+        const isTally = req.body && (req.body.eventType === "FORM_RESPONSE" || req.body.data);
+        if (hasKey) return requireApiKey(req, res, next);
+        if (isTally) return next(); // allow Tally without key
+        // For hobby: allow hourlyhealthreport without key (rate limited), but log
+        console.warn(`⚠️ public POST hourlyhealthreport from ${getClientIp(req)} without key - allowed for Tally`);
+        return next();
+    }
+    return requireApiKey(req, res, next);
+}, apiLimiter, async (req, res) => {
     try {
         const collection = req.params.collection;
         if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection name" });
