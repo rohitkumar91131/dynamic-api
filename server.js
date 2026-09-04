@@ -1827,9 +1827,42 @@ async function serveThumb(req, res) {
         res.status(500).json({ success: false, message: isProd ? "Thumb failed" : e.message });
     }
 }
+// Full HD original proxy for PDF (frontend only, CORS-enabled) - bypasses Tally CORS
+async function serveOriginal(req, res) {
+    try {
+        const collection = req.params.collection;
+        const id = req.params.id;
+        let idx = req.params.idx !== undefined ? parseInt(req.params.idx, 10) : parseInt(req.query.idx || req.query.i || "0", 10);
+        if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection" });
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: "Invalid id" });
+        if (isNaN(idx) || idx < 0) idx = 0;
+        if (["api_keys","otps","admin_sessions","thumbnails"].includes(collection)) return res.status(403).json({ success: false, message: "Forbidden" });
+        const database = await getDB();
+        const doc = await database.collection(collection).findOne({ _id: new ObjectId(id) });
+        if (!doc) return res.status(404).json({ success: false, message: "Document not found" });
+        const images = extractTallyImages(doc.data);
+        if (!images[idx]) return res.status(404).json({ success: false, message: "No image at idx " + idx });
+        const origUrl = images[idx].url;
+        const controller = new AbortController();
+        const t = setTimeout(()=>controller.abort(), 15000);
+        let r;
+        try { r = await fetch(origUrl, { signal: controller.signal }); } finally { clearTimeout(t); }
+        if (!r.ok) return res.status(502).json({ success: false, message: `Failed to fetch original ${r.status}` });
+        const ct = r.headers.get("content-type") || "image/jpeg";
+        const buf = Buffer.from(await r.arrayBuffer());
+        res.setHeader("Content-Type", ct);
+        res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+        res.setHeader("Content-Length", buf.length);
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("X-Original-Size", String(buf.length));
+        return res.send(buf);
+    } catch (e) { console.error("serveOriginal error:", e); res.status(500).json({ success: false, message: isProd ? "Image proxy failed" : e.message }); }
+}
 // two routes: ?idx=0 and /:idx
 app.get("/api/:collection/:id/thumb", globalLimiter, serveThumb);
 app.get("/api/:collection/:id/thumb/:idx", globalLimiter, serveThumb);
+app.get("/api/:collection/:id/image", globalLimiter, serveOriginal);
+app.get("/api/:collection/:id/image/:idx", globalLimiter, serveOriginal);
 
 // helper to inject thumbUrls into list/detail responses (optional, for frontend convenience)
 async function enrichWithThumbUrls(docs, collection) {
