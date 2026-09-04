@@ -11,6 +11,8 @@ const { v4: uuidv4 } = require("uuid");
 const { MongoClient, ObjectId } = require("mongodb");
 const OpenAI = require("openai");
 const nodemailer = require("nodemailer");
+let sharp = null;
+try { sharp = require("sharp"); } catch (e) { console.warn("⚠️ sharp not installed - thumbnails will be skipped until npm install"); }
 
 const app = express();
 
@@ -32,6 +34,12 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
 const isProd = NODE_ENV === "production";
+// Telegram thumbnail config
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const THUMB_MAX_KB = parseInt(process.env.THUMB_MAX_KB || "25", 10);
+const THUMB_WIDTH = parseInt(process.env.THUMB_WIDTH || "320", 10);
+const THUMB_QUALITY = parseInt(process.env.THUMB_QUALITY || "65", 10);
 
 // ==================== SECURITY MIDDLEWARE ====================
 app.set("trust proxy", 1);
@@ -139,6 +147,8 @@ async function getDB() {
             await db.collection("invalid_api_attempts").createIndex({ timestamp: -1 });
             await db.collection("invalid_api_attempts").createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
             await db.collection("invalid_api_attempts").createIndex({ reason: 1 });
+            await db.collection("thumbnails").createIndex({ collection: 1, docId: 1, idx: 1 }, { unique: true });
+            await db.collection("thumbnails").createIndex({ createdAt: -1 });
         } catch (e) { console.warn("Index ensure warn:", e.message); }
         // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
         try {
@@ -260,6 +270,201 @@ function maskKey(key) {
     const s = String(key);
     if (s.length <= 12) return s.slice(0,4) + "****";
     return s.slice(0, 8) + "••••••••" + s.slice(-4);
+}
+
+// ==================== THUMBNAIL + TELEGRAM HELPERS (25kb webp) ====================
+function extractTallyImages(data) {
+    const urls = [];
+    try {
+        if (data && data.fields && Array.isArray(data.fields)) {
+            for (const f of data.fields) {
+                if (f.type === "FILE_UPLOAD" && Array.isArray(f.value)) {
+                    for (const file of f.value) {
+                        if (file && file.url) urls.push({
+                            url: String(file.url),
+                            name: String(file.name||"file"),
+                            id: String(file.id||""),
+                            mimeType: String(file.mimeType||""),
+                            size: file.size || 0
+                        });
+                    }
+                }
+            }
+        }
+    } catch {}
+    return urls;
+}
+
+function detectFileKind(buf, fileName, mimeHint) {
+    const name = String(fileName||"").toLowerCase();
+    const mime = String(mimeHint||"").toLowerCase();
+    // quick check via mime / extension
+    if (mime.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|tiff|heic|avif)$/i.test(name)) return "image";
+    if (mime.startsWith("video/") || /\.(mp4|mov|avi|webm|mkv|m4v|3gp)$/i.test(name)) return "video";
+    if (mime === "application/pdf" || /\.pdf$/i.test(name)) return "pdf";
+    if (mime.startsWith("audio/") || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(name)) return "audio";
+    // magic bytes fallback
+    if (buf && buf.length >= 4) {
+        // JPEG FF D8 FF, PNG 89 50 4E 47, WEBP 52 49 46 46, GIF 47 49 46, PDF 25 50 44 46, MP4 ftyp
+        if (buf[0]===0xFF && buf[1]===0xD8) return "image";
+        if (buf[0]===0x89 && buf[1]===0x50) return "image";
+        if (buf[0]===0x25 && buf[1]===0x50 && buf[2]===0x44) return "pdf";
+        if (buf.slice(4,8).toString()==="ftyp") return "video";
+        if (buf.slice(0,4).toString()==="RIFF" && buf.slice(8,12).toString()==="WEBP") return "image";
+    }
+    return "other";
+}
+
+async function generatePlaceholderWebp(label, subLabel) {
+    if (!sharp) throw new Error("sharp not available");
+    const w = THUMB_WIDTH, h = Math.round(w * 0.66); // 320x211
+    const bg = label==="video" ? "#0f172a" : label==="pdf" ? "#451a03" : label==="audio" ? "#14532d" : "#1e293b";
+    const accent = label==="video" ? "#38bdf8" : label==="pdf" ? "#f87171" : label==="audio" ? "#4ade80" : "#94a3b8";
+    const icon = label==="video" ? "▶" : label==="pdf" ? "PDF" : label==="audio" ? "♫" : "FILE";
+    const svg = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100%" height="100%" rx="12" fill="${bg}"/>
+      <rect x="12" y="12" width="${w-24}" height="${h-24}" rx="10" fill="none" stroke="${accent}" stroke-opacity="0.3" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="50%" y="42%" dominant-baseline="middle" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="42" font-weight="800" fill="${accent}">${icon}</text>
+      <text x="50%" y="62%" dominant-baseline="middle" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700" fill="#e2e8f0" letter-spacing="0.6">${String(subLabel||label).slice(0,24).toUpperCase()}</text>
+      <text x="50%" y="75%" dominant-baseline="middle" text-anchor="middle" font-family="Arial,sans-serif" font-size="9" fill="#94a3b8">${w}w • webp • &lt;25kb</text>
+    </svg>`;
+    const buf = await sharp(Buffer.from(svg)).webp({ quality: THUMB_QUALITY, effort: 6 }).toBuffer();
+    return { buffer: buf, quality: THUMB_QUALITY, size: buf.length, placeholder: true, kind: label };
+}
+
+async function generateWebpThumbnail(inputBuffer, fileNameHint, mimeHint) {
+    if (!sharp) throw new Error("sharp not available");
+    const kind = detectFileKind(inputBuffer, fileNameHint, mimeHint);
+    if (kind !== "image") {
+        // video/pdf/audio/other -> crisp placeholder webp (still <25kb, ~4-6kb)
+        return generatePlaceholderWebp(kind, fileNameHint ? fileNameHint.split('.').pop() : kind);
+    }
+    const targetBytes = THUMB_MAX_KB * 1024;
+    const qualities = [THUMB_QUALITY, 60, 50, 40, 30, 20];
+    let best = null;
+    for (const q of qualities) {
+        try {
+            const buf = await sharp(inputBuffer)
+                .rotate()
+                .resize({ width: THUMB_WIDTH, withoutEnlargement: true })
+                .webp({ quality: q, effort: 6 })
+                .toBuffer();
+            best = buf;
+            if (buf.length <= targetBytes) return { buffer: buf, quality: q, size: buf.length, kind: "image" };
+        } catch (e) {
+            // sharp failed -> fallback to placeholder (e.g. heic without decoder)
+            console.warn("sharp image decode fail, placeholder:", e.message);
+            return generatePlaceholderWebp("image", "image");
+        }
+    }
+    if (best && best.length > targetBytes) {
+        try {
+            const smaller = await sharp(inputBuffer).rotate().resize({ width: 240, withoutEnlargement: true }).webp({ quality: 30, effort: 6 }).toBuffer();
+            return { buffer: smaller, quality: 30, size: smaller.length, fallback: true, kind: "image" };
+        } catch { return generatePlaceholderWebp("image", "image"); }
+    }
+    return { buffer: best, quality: qualities[qualities.length-1], size: best.length, kind: "image" };
+}
+
+async function uploadToTelegram(webpBuffer, caption = "") {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`;
+        const form = new FormData();
+        form.append("chat_id", TELEGRAM_CHAT_ID);
+        const blob = new Blob([webpBuffer], { type: "image/webp" });
+        form.append("photo", blob, "thumb.webp");
+        if (caption) form.append("caption", String(caption).slice(0, 900));
+        const controller = new AbortController();
+        const t = setTimeout(()=>controller.abort(), 15000);
+        try {
+            const res = await fetch(url, { method: "POST", body: form, signal: controller.signal });
+            const j = await res.json().catch(()=>null);
+            if (!res.ok || !j?.ok) {
+                console.warn("Telegram upload failed:", res.status, j?.description || j);
+                return null;
+            }
+            // Telegram returns photo array sorted smallest->largest
+            const photos = j.result?.photo || [];
+            const largest = photos[photos.length-1];
+            return {
+                file_id: largest?.file_id || null,
+                file_unique_id: largest?.file_unique_id || null,
+                message_id: j.result?.message_id || null,
+                raw: j.result
+            };
+        } finally { clearTimeout(t); }
+    } catch (e) {
+        console.warn("uploadToTelegram error:", e.message);
+        return null;
+    }
+}
+
+async function processThumbnailsForDoc(collection, docId, data) {
+    const images = extractTallyImages(data);
+    if (!images.length) return { processed: 0 };
+    if (!sharp) { console.warn("sharp missing - skip thumbnail for", docId); return { processed: 0, skipped: true }; }
+    const database = await getDB();
+    const results = [];
+    for (let idx = 0; idx < images.length; idx++) {
+        const img = images[idx];
+        try {
+            // fetch original (tally private url) - 10s timeout, 8mb max (images) / 15mb for video/pdf
+            const controller = new AbortController();
+            const t = setTimeout(()=>controller.abort(), 15000);
+            let origBuf; let contentType = img.mimeType || "";
+            try {
+                const r = await fetch(img.url, { signal: controller.signal });
+                if (!r.ok) throw new Error(`fetch ${r.status}`);
+                contentType = r.headers.get("content-type") || contentType;
+                const ab = await r.arrayBuffer();
+                // video/pdf may be larger, allow 15mb for fetch but still thumb is 25kb
+                const limit = contentType.startsWith("video/") || contentType==="application/pdf" ? 15*1024*1024 : 8*1024*1024;
+                if (ab.byteLength > limit) throw new Error("file too large");
+                origBuf = Buffer.from(ab);
+            } finally { clearTimeout(t); }
+            const { buffer: webpBuf, quality, size, kind, placeholder } = await generateWebpThumbnail(origBuf, img.name, contentType);
+            console.log(`🖼️ thumb ${docId}[${idx}] kind=${kind} ${origBuf.length} -> ${size} bytes q=${quality} webp${placeholder?" (placeholder)":""}`);
+
+            // upload to telegram (optional) - always photo (webp placeholder for video/pdf too)
+            const tg = await uploadToTelegram(webpBuf, `${collection}/${docId} #${idx} [${kind}] ${img.name} ${size}B q${quality}${placeholder?" placeholder":""}`);
+            // store in dedicated thumbnails collection for fast proxy (binary)
+            const thumbDoc = {
+                collection,
+                docId: new ObjectId(docId),
+                idx,
+                origUrl: img.url,
+                origName: img.name,
+                origMime: contentType,
+                kind, // image | video | pdf | audio | other | placeholder
+                isPlaceholder: !!placeholder,
+                createdAt: new Date(),
+                thumbSize: size,
+                thumbWidth: THUMB_WIDTH,
+                quality,
+                mimeType: "image/webp",
+                buffer: webpBuf,
+                telegram: tg ? { file_id: tg.file_id, file_unique_id: tg.file_unique_id, message_id: tg.message_id } : null
+            };
+            await database.collection("thumbnails").updateOne(
+                { collection, docId: new ObjectId(docId), idx },
+                { $set: thumbDoc },
+                { upsert: true }
+            );
+            results.push({ idx, size, quality, kind, placeholder: !!placeholder, telegram_file_id: tg?.file_id || null });
+        } catch (e) {
+            console.warn(`thumb fail ${docId}[${idx}]`, e.message);
+            results.push({ idx, error: e.message });
+        }
+    }
+    // update original doc with thumbRefs array (no binary, just refs)
+    try {
+        await database.collection(collection).updateOne(
+            { _id: new ObjectId(docId) },
+            { $set: { thumbnails: results, thumbnailAt: new Date() } }
+        );
+    } catch {}
+    return { processed: results.length, results };
 }
 
 // Kira call with timeout + sanitization
@@ -1298,6 +1503,15 @@ app.post("/api/:collection", requireApiKey, apiLimiter, async (req, res) => {
             ai_analysis: aiAnalysis ? "Generated" : (KIRA_API_KEY ? "Failed" : "Skipped (no KIRA_API_KEY)"),
             modelUsed: tagModel
         });
+
+        // Fire-and-forget 25kb webp thumbnail + Telegram upload (non-blocking)
+        const insertedId = result.insertedId;
+        const dataForThumb = sanitizedData;
+        setImmediate(() => {
+            processThumbnailsForDoc(collection, insertedId, dataForThumb)
+                .then(r => { if (r.processed) console.log(`✅ thumbnails done for ${collection}/${insertedId}:`, r.results); })
+                .catch(e => console.warn("thumbnail bg error:", e.message));
+        });
     } catch (err) { sendError(res, err, "Failed to create", 500); }
 });
 
@@ -1395,6 +1609,9 @@ app.get("/api/:collection", requireApiKey, apiLimiter, async (req, res) => {
         const total = await col.countDocuments({});
         const data = await col.find({}).sort(sort).skip(skip).limit(limit).toArray();
 
+        // enrich with thumbUrls for frontend (non-blocking, ignore errors)
+        try { await enrichWithThumbUrls(data, collection); } catch {}
+
         res.json({
             success: true,
             data,
@@ -1413,6 +1630,7 @@ app.get("/api/:collection/:id", requireApiKey, apiLimiter, async (req, res) => {
         const database = await getDB();
         const data = await database.collection(collection).findOne({ _id: new ObjectId(id) });
         if (!data) return res.status(404).json({ success: false, message: "Not found" });
+        try { await enrichWithThumbUrls([data], collection); } catch {}
         res.json({ success: true, data });
     } catch (err) { sendError(res, err); }
 });
@@ -1450,6 +1668,105 @@ app.patch("/api/:collection/:id", requireApiKey, apiLimiter, async (req, res) =>
         res.json({ success: true, result });
     } catch (err) { sendError(res, err); }
 });
+
+// ==================== THUMBNAIL PROXY (25kb webp, public for frontend) ====================
+// Frontend: <img src="https://dynamicapi.rohits.online/api/hourlyhealthreport/<id>/thumb?idx=0">
+// No API key required for thumbs (rate limited) - thumbs are small & cacheable 1d
+// Also supports /thumb/:idx
+async function serveThumb(req, res) {
+    try {
+        const collection = req.params.collection;
+        const id = req.params.id;
+        let idx = req.params.idx !== undefined ? parseInt(req.params.idx, 10) : parseInt(req.query.idx || req.query.i || "0", 10);
+        if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection" });
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: "Invalid id" });
+        if (isNaN(idx) || idx < 0) idx = 0;
+        if (["api_keys","otps","admin_sessions","thumbnails"].includes(collection)) return res.status(403).json({ success: false, message: "Forbidden" });
+        const database = await getDB();
+        // try cache first
+        let thumb = await database.collection("thumbnails").findOne({ collection, docId: new ObjectId(id), idx });
+        // on-demand generate if missing (backfill for old docs)
+        if (!thumb) {
+            const doc = await database.collection(collection).findOne({ _id: new ObjectId(id) });
+            if (!doc) return res.status(404).json({ success: false, message: "Document not found" });
+            const images = extractTallyImages(doc.data);
+            if (!images[idx]) return res.status(404).json({ success: false, message: "No image at idx " + idx });
+            if (!sharp) return res.status(503).json({ success: false, message: "Thumbnail service unavailable (sharp missing)" });
+            // generate now (sync, ~300ms) - handles image/video/pdf/other via placeholder
+            try {
+                const r = await fetch(images[idx].url);
+                if (!r.ok) return res.status(502).json({ success: false, message: "Failed to fetch original" });
+                const buf = Buffer.from(await r.arrayBuffer());
+                const ct = r.headers.get("content-type") || images[idx].mimeType || "";
+                const { buffer: webpBuf, size, quality, kind, placeholder } = await generateWebpThumbnail(buf, images[idx].name, ct);
+                thumb = { buffer: webpBuf, mimeType: "image/webp", thumbSize: size, quality, kind };
+                const tg = await uploadToTelegram(webpBuf, `${collection}/${id} #${idx} [${kind}] on-demand ${size}B${placeholder?" placeholder":""}`);
+                await database.collection("thumbnails").updateOne(
+                    { collection, docId: new ObjectId(id), idx },
+                    { $set: { collection, docId: new ObjectId(id), idx, origUrl: images[idx].url, origName: images[idx].name, origMime: ct, kind, isPlaceholder: !!placeholder, createdAt: new Date(), thumbSize: size, thumbWidth: THUMB_WIDTH, quality, mimeType: "image/webp", buffer: webpBuf, telegram: tg ? { file_id: tg.file_id, file_unique_id: tg.file_unique_id } : null } },
+                    { upsert: true }
+                );
+            } catch (e) {
+                return res.status(500).json({ success: false, message: "Thumb generation failed: " + e.message });
+            }
+        }
+        const buf = thumb.buffer?.buffer ? Buffer.from(thumb.buffer.buffer || thumb.buffer) : thumb.buffer;
+        // Extract actual Buffer (stored as BSON Binary)
+        let outBuf = buf;
+        if (thumb.buffer && thumb.buffer.buffer) outBuf = Buffer.from(thumb.buffer.buffer);
+        else if (Buffer.isBuffer(thumb.buffer)) outBuf = thumb.buffer;
+        else if (thumb.buffer && typeof thumb.buffer === "object" && thumb.buffer.type === "Buffer") outBuf = Buffer.from(thumb.buffer.data);
+        else outBuf = Buffer.from(thumb.buffer);
+        res.setHeader("Content-Type", thumb.mimeType || "image/webp");
+        res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+        res.setHeader("Content-Length", outBuf.length);
+        res.setHeader("ETag", `"${collection}-${id}-${idx}-${outBuf.length}"`);
+        res.setHeader("X-Thumb-Size", String(outBuf.length));
+        res.setHeader("X-Thumb-Quality", String(thumb.quality || ""));
+        // Tiny CORS for frontend <img>
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(outBuf);
+    } catch (e) {
+        console.error("serveThumb error:", e);
+        res.status(500).json({ success: false, message: isProd ? "Thumb failed" : e.message });
+    }
+}
+// two routes: ?idx=0 and /:idx
+app.get("/api/:collection/:id/thumb", globalLimiter, serveThumb);
+app.get("/api/:collection/:id/thumb/:idx", globalLimiter, serveThumb);
+
+// helper to inject thumbUrls into list/detail responses (optional, for frontend convenience)
+async function enrichWithThumbUrls(docs, collection) {
+    if (!Array.isArray(docs) || !docs.length) return;
+    const database = await getDB();
+    const ids = docs.map(d => d._id);
+    const thumbs = await database.collection("thumbnails").find({ collection, docId: { $in: ids } }).project({ docId: 1, idx: 1 }).toArray();
+    const map = {};
+    for (const t of thumbs) {
+        const k = String(t.docId);
+        if (!map[k]) map[k] = [];
+        map[k].push(t.idx);
+    }
+    const base = process.env.PUBLIC_BASE_URL || "";
+    for (const d of docs) {
+        const k = String(d._id);
+        const idxs = map[k];
+        if (idxs && idxs.length) {
+            d.thumbUrls = idxs.sort((a,b)=>a-b).map(i => `/api/${collection}/${d._id}/thumb?idx=${i}`);
+            d.thumbCount = idxs.length;
+        } else {
+            // fallback pattern - frontend can try anyway (on-demand will generate)
+            const imgs = extractTallyImages(d.data);
+            if (imgs.length) {
+                d.thumbUrls = imgs.map((_, i) => `/api/${collection}/${d._id}/thumb?idx=${i}`);
+                d.thumbCount = imgs.length;
+                d.thumbPending = true;
+            }
+        }
+        // full proxy URLs for convenience
+        if (d.thumbUrls) d.thumbBase = base;
+    }
+}
 
 // 7. DELETE
 app.delete("/api/:collection/:id", requireApiKey, apiLimiter, async (req, res) => {
