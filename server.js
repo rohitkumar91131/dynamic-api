@@ -1610,8 +1610,35 @@ app.get("/api/:collection", globalLimiter, async (req, res, next) => {
         const database = await getDB();
         const col = database.collection(collection);
 
-        const total = await col.countDocuments({});
-        const data = await col.find({}).sort(sort).skip(skip).limit(limit).toArray();
+        // Date filter for Health Journal: ?date=YYYY-MM-DD (IST) or ?from=&to= ISO
+        let filter = {};
+        const dateParam = String(req.query.date || "").trim();
+        const fromParam = String(req.query.from || "").trim();
+        const toParam = String(req.query.to || "").trim();
+        if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+            // IST day 00:00 to 23:59:59.999 => UTC = IST -5:30
+            const istOffsetMs = 5.5 * 60 * 60 * 1000;
+            const startIst = new Date(dateParam + "T00:00:00.000+05:30");
+            const endIst = new Date(dateParam + "T23:59:59.999+05:30");
+            if (!isNaN(startIst.getTime()) && !isNaN(endIst.getTime())) {
+                filter = { $or: [
+                    { createdAt: { $gte: startIst, $lte: endIst } },
+                    { timestamp: { $gte: startIst, $lte: endIst } },
+                    // fallback: also match data.fields Date value == dateParam (string match for tally)
+                    { "data.fields": { $elemMatch: { type: { $in: ["INPUT_DATE", "DATE"] }, value: dateParam } } }
+                ]};
+            }
+        } else if (fromParam || toParam) {
+            const gte = fromParam ? new Date(fromParam) : null;
+            const lte = toParam ? new Date(toParam) : null;
+            const range = {};
+            if (gte && !isNaN(gte.getTime())) range.$gte = gte;
+            if (lte && !isNaN(lte.getTime())) range.$lte = lte;
+            if (Object.keys(range).length) filter = { createdAt: range };
+        }
+
+        const total = await col.countDocuments(filter);
+        const data = await col.find(filter).sort(sort).skip(skip).limit(limit).toArray();
 
         // enrich with thumbUrls for frontend (non-blocking, ignore errors)
         try { await enrichWithThumbUrls(data, collection); } catch {}
