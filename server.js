@@ -1217,6 +1217,7 @@ app.post(`${normalizedAdminBase}/backfill-thumbnails`, requireAdminAuth, async (
                 failed++;
                 details.push({ id: doc._id, error: e.message });
             }
+            await new Promise(r=>setTimeout(r, 300));
             // small delay to avoid hammering
             await new Promise(r=>setTimeout(r, 300));
         }
@@ -1226,6 +1227,59 @@ app.post(`${normalizedAdminBase}/backfill-thumbnails`, requireAdminAuth, async (
             $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ]
         });
         res.json({ success: true, processed, failed, remaining, details: details.slice(0,20) });
+    } catch (e) { sendError(res, e); }
+});
+
+// ==================== ERA HISTORY (Health Journal eras) ====================
+// Public for hobby - stores which era user was in from when to when, and default
+app.get("/api/era", globalLimiter, async (req, res) => {
+    try {
+        const database = await getDB();
+        await database.collection("era_history").createIndex({ userKey: 1, from: -1 }).catch(()=>{});
+        await database.collection("era_defaults").createIndex({ userKey: 1 }, { unique: true }).catch(()=>{});
+        const userKey = String(req.headers["x-api-key"] || req.query.api_key || req.headers["x-device-id"] || req.query.deviceId || "anonymous").slice(0,64);
+        const def = await database.collection("era_defaults").findOne({ userKey });
+        const current = await database.collection("era_history").find({ userKey, to: null }).sort({ from: -1 }).limit(1).toArray();
+        res.json({ success: true, defaultEra: def?.era || "heartbeat", currentEra: current[0]?.era || def?.era || "heartbeat", userKey });
+    } catch (e) { sendError(res, e); }
+});
+app.get("/api/era/history", globalLimiter, async (req, res) => {
+    try {
+        const database = await getDB();
+        const userKey = String(req.headers["x-api-key"] || req.query.api_key || req.headers["x-device-id"] || req.query.deviceId || "anonymous").slice(0,64);
+        const history = await database.collection("era_history").find({ userKey }).sort({ from: -1 }).limit(100).toArray();
+        const def = await database.collection("era_defaults").findOne({ userKey });
+        res.json({ success: true, history, defaultEra: def?.era || null, total: history.length });
+    } catch (e) { sendError(res, e); }
+});
+app.post("/api/era", globalLimiter, async (req, res) => {
+    try {
+        const era = sanitizeString(String(req.body?.era || ""), 30).toLowerCase();
+        const valid = ["heartbeat","acidity","burping","bloating","acidity-burping","bloating-burping","calm"];
+        if (!valid.includes(era)) return res.status(400).json({ success: false, message: "Invalid era. Valid: " + valid.join(", ") });
+        const userKey = String(req.headers["x-api-key"] || req.query.api_key || req.headers["x-device-id"] || req.body?.deviceId || "anonymous").slice(0,64);
+        const database = await getDB();
+        await database.collection("era_history").createIndex({ userKey: 1, from: -1 }).catch(()=>{});
+        // close previous open era
+        await database.collection("era_history").updateMany({ userKey, to: null }, { $set: { to: new Date() } });
+        const doc = { userKey, era, from: new Date(), to: null, createdAt: new Date() };
+        await database.collection("era_history").insertOne(doc);
+        // also update default if requested
+        if (req.body?.setDefault) {
+            await database.collection("era_defaults").updateOne({ userKey }, { $set: { era, updatedAt: new Date() } }, { upsert: true });
+        }
+        res.json({ success: true, era, from: doc.from });
+    } catch (e) { sendError(res, e); }
+});
+app.post("/api/era/default", globalLimiter, async (req, res) => {
+    try {
+        const era = sanitizeString(String(req.body?.era || ""), 30).toLowerCase();
+        const valid = ["heartbeat","acidity","burping","bloating","acidity-burping","bloating-burping","calm"];
+        if (!valid.includes(era)) return res.status(400).json({ success: false, message: "Invalid era" });
+        const userKey = String(req.headers["x-api-key"] || req.query.api_key || req.headers["x-device-id"] || req.body?.deviceId || "anonymous").slice(0,64);
+        const database = await getDB();
+        await database.collection("era_defaults").updateOne({ userKey }, { $set: { era, updatedAt: new Date() } }, { upsert: true });
+        res.json({ success: true, defaultEra: era });
     } catch (e) { sendError(res, e); }
 });
 
