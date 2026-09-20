@@ -217,6 +217,13 @@ Please format your response in clear Markdown with these exact sections:
 function isValidCollection(name) {
     return typeof name === "string" && name.length >= 1 && name.length <= 64 && /^[a-zA-Z0-9_-]+$/.test(name);
 }
+// Public collections - open POST/GET without API key (hobby mode)
+const PUBLIC_COLLECTIONS = new Set(["hourlyhealthreport", "notion_video", "notion-video", "notionvideo", "notion video"]);
+function normalizeCollection(name) {
+    // "notion video" / "notion-video" / "notionvideo" -> "notion_video"
+    if (name === "notion video" || name === "notion-video" || name === "notionvideo") return "notion_video";
+    return name;
+}
 function isValidObjectId(id) {
     return ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 }
@@ -1519,15 +1526,24 @@ function parsePagination(req) {
 
 // 1. CREATE with Kira auto-tag+analysis (dynamic, sanitized, mass-assignment fixed) - hourlyhealthreport is public for Tally webhook (hobby)
 app.post("/api/:collection", globalLimiter, async (req, res, next) => {
-    const colCheck = req.params.collection;
-    if (colCheck === "hourlyhealthreport") {
-        // Try API key if provided (query/header), but allow Tally webhook without key (has eventType/data.fields)
+    let colCheck = req.params.collection;
+    const normalized = normalizeCollection(colCheck);
+    if (normalized !== colCheck) req.params.collection = normalized;
+    colCheck = normalized;
+
+    if (PUBLIC_COLLECTIONS.has(colCheck)) {
+        if (colCheck === "hourlyhealthreport") {
+            const hasKey = req.headers["x-api-key"] || req.headers["authorization"] || req.query.api_key;
+            const isTally = req.body && (req.body.eventType === "FORM_RESPONSE" || req.body.data);
+            if (hasKey) return requireApiKey(req, res, next);
+            if (isTally) return next();
+            console.warn(`⚠️ public POST hourlyhealthreport from ${getClientIp(req)} without key - allowed for Tally`);
+            return next();
+        }
+        // notion_video family - fully open (no auth), rate limited only
         const hasKey = req.headers["x-api-key"] || req.headers["authorization"] || req.query.api_key;
-        const isTally = req.body && (req.body.eventType === "FORM_RESPONSE" || req.body.data);
         if (hasKey) return requireApiKey(req, res, next);
-        if (isTally) return next(); // allow Tally without key
-        // For hobby: allow hourlyhealthreport without key (rate limited), but log
-        console.warn(`⚠️ public POST hourlyhealthreport from ${getClientIp(req)} without key - allowed for Tally`);
+        console.warn(`⚠️ public POST ${colCheck} from ${getClientIp(req)} - open mode (notion video)`);
         return next();
     }
     return requireApiKey(req, res, next);
@@ -1710,10 +1726,35 @@ app.patch("/api/:collection/comment/:id", requireApiKey, apiLimiter, async (req,
     } catch (err) { sendError(res, err); }
 });
 
-// 3. READ ALL with pagination (fixes DoS) - hourlyhealthreport is public for Health Journal (hobby), others need API key
+// Fast thumbnail for Supabase/Health — Vercel Node sharp (25kb) — MUST be before /api/:collection (otherwise 401)
+app.get("/api/thumbnail", globalLimiter, async (req, res) => {
+  try {
+    const url = String(req.query.url || "").trim();
+    if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ success:false, message:"Missing ?url=https://..." });
+    if (!sharp) return res.status(503).json({ success:false, message:"sharp missing" });
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).json({ success:false, message:"fetch original failed "+r.status });
+    const buf = Buffer.from(await r.arrayBuffer());
+    const ct = r.headers.get("content-type") || "";
+    const { buffer: webpBuf, size, quality, kind } = await generateWebpThumbnail(buf, url.split("/").pop() || "image.jpg", ct);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+    res.setHeader("Content-Type", "image/webp");
+    res.setHeader("X-Thumb-Size", String(webpBuf.length));
+    res.setHeader("X-Thumb-KB", String(Math.round(webpBuf.length/1024)));
+    res.setHeader("X-Thumb-Quality", String(quality));
+    res.setHeader("X-Thumb-Kind", kind);
+    return res.send(webpBuf);
+  } catch(e){ console.error("thumbnail error", e); res.status(500).json({ success:false, message:e.message }); }
+});
+
+// 3. READ ALL with pagination (fixes DoS) - hourlyhealthreport + notion_video public, others need API key
 app.get("/api/:collection", globalLimiter, async (req, res, next) => {
-    const colCheck = req.params.collection;
-    if (colCheck === "hourlyhealthreport") return next();
+    let colCheck = req.params.collection;
+    const normalized = normalizeCollection(colCheck);
+    if (normalized !== colCheck) req.params.collection = normalized;
+    colCheck = normalized;
+    if (PUBLIC_COLLECTIONS.has(colCheck)) return next();
     return requireApiKey(req, res, next);
 }, apiLimiter, async (req, res) => {
     try {
@@ -1766,10 +1807,13 @@ app.get("/api/:collection", globalLimiter, async (req, res, next) => {
     } catch (err) { sendError(res, err); }
 });
 
-// 4. READ ONE - hourlyhealthreport public, others protected
+// 4. READ ONE - hourlyhealthreport + notion_video public, others protected
 app.get("/api/:collection/:id", globalLimiter, async (req, res, next) => {
-    const colCheck = req.params.collection;
-    if (colCheck === "hourlyhealthreport") return next();
+    let colCheck = req.params.collection;
+    const normalized = normalizeCollection(colCheck);
+    if (normalized !== colCheck) req.params.collection = normalized;
+    colCheck = normalized;
+    if (PUBLIC_COLLECTIONS.has(colCheck)) return next();
     return requireApiKey(req, res, next);
 }, apiLimiter, async (req, res) => {
     try {
