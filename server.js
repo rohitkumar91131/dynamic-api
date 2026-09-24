@@ -123,53 +123,120 @@ const otpLimiter = rateLimit({
 });
 app.use(globalLimiter);
 
-// ==================== MONGODB ====================
-if (!process.env.MONGODB_URI) console.error("❌ MONGODB_URI is required");
-const client = new MongoClient(process.env.MONGODB_URI || "mongodb://localhost:27017", {
+// ==================== MONGODB ATLAS ====================
+// Atlas SRV implementation — Vercel serverless optimized
+// URI: mongodb+srv://user:pass@cluster.mongodb.net/tally?retryWrites=true&w=majority&appName=Cluster
+// Crawled from .env, supports DATABASE_NAME override
+if (!process.env.MONGODB_URI) console.error("❌ MONGODB_URI is required — check Atlas credentials in .env");
+if (process.env.MONGODB_URI && !process.env.MONGODB_URI.startsWith("mongodb")) {
+    console.error("❌ MONGODB_URI invalid — must start with mongodb:// or mongodb+srv://");
+}
+if (process.env.MONGODB_URI && process.env.MONGODB_URI.includes("user:pass")) {
+    console.error("❌ MONGODB_URI still placeholder — replace with Atlas SRV from .env");
+}
+
+// Vercel serverless: global cache prevents connection explosion on hot reloads
+const atlasUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+const atlasOpts = {
     maxPoolSize: 10,
+    minPoolSize: 2,
+    maxIdleTimeMS: 10000,
     serverSelectionTimeoutMS: 8000,
     connectTimeoutMS: 8000,
-});
-let db = null;
+    socketTimeoutMS: 30000,
+    retryWrites: true,
+    retryReads: true,
+};
+
+// global cache for serverless
+if (!global._mongoClient) global._mongoClient = null;
+if (!global._mongoDb) global._mongoDb = null;
+if (!global._mongoPromise) global._mongoPromise = null;
+
+let client = global._mongoClient;
+let db = global._mongoDb;
+
 async function getDB() {
-    if (!db) {
-        await client.connect();
-        const dbName = process.env.DATABASE_NAME || undefined; // if undefined, use from URI
-        db = dbName ? client.db(dbName) : client.db();
-        console.log("✅ MongoDB Connected");
-        // Ensure indexes
+    // Return cached db if already connected and ping succeeds
+    if (db) {
         try {
-            await db.collection("otps").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-            await db.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-            await db.collection("api_keys").createIndex({ keyHash: 1 }, { unique: true, sparse: true });
-            await db.collection("api_keys").createIndex({ key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
-            await db.collection("api_keys").createIndex({ isActive: 1 });
-            await db.collection("invalid_api_attempts").createIndex({ timestamp: -1 });
-            await db.collection("invalid_api_attempts").createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
-            await db.collection("invalid_api_attempts").createIndex({ reason: 1 });
-            await db.collection("thumbnails").createIndex({ collection: 1, docId: 1, idx: 1 }, { unique: true });
-            await db.collection("thumbnails").createIndex({ createdAt: -1 });
-        } catch (e) { console.warn("Index ensure warn:", e.message); }
-        // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
-        try {
-            const col = db.collection("api_keys");
-            const plaintextKeys = await col.find({ key: { $regex: "^dyn_" } }).limit(50).toArray();
-            for (const doc of plaintextKeys) {
-                if (doc.key && !isHashedKey(doc.key) && !doc.keyHash) {
-                    const hashed = hashApiKey(doc.key);
-                    const preview = doc.keyPreview || maskKey(doc.key);
-                    // skip if hash already exists
-                    const exists = await col.findOne({ keyHash: hashed });
-                    if (exists) continue;
-                    await col.updateOne({ _id: doc._id }, { $set: { keyHash: hashed, key: hashed, keyPreview: preview, migratedAt: new Date() } });
-                    console.log(`🔐 auto-migrated key ${doc._id} ${preview}`);
-                }
-            }
-            if (plaintextKeys.length) console.log(`✅ auto-migration checked ${plaintextKeys.length} plaintext keys`);
-        } catch (e) { console.warn("auto-migrate warn:", e.message); }
+            // lightweight ping every call? only if needed - skip for perf, just return
+            return db;
+        } catch {}
     }
+    // Reuse global promise to avoid race
+    if (!global._mongoPromise) {
+        if (!client) {
+            client = new MongoClient(atlasUri, atlasOpts);
+            global._mongoClient = client;
+        }
+        global._mongoPromise = client.connect().then(async (c) => {
+            const dbName = process.env.DATABASE_NAME || undefined; // if undefined, use from URI (tally)
+            const database = dbName ? c.db(dbName) : c.db();
+            // Verify connection with ping (Atlas health)
+            try {
+                await database.command({ ping: 1 });
+                console.log(`✅ MongoDB Atlas Connected — db: ${database.databaseName} | host: ${atlasUri.split("@")[1]?.split("/")[0] || "localhost"}`);
+            } catch (e) {
+                console.warn("⚠️ Atlas ping failed:", e.message);
+            }
+            // Ensure indexes (idempotent)
+            try {
+                await database.collection("otps").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+                await database.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+                await database.collection("api_keys").createIndex({ keyHash: 1 }, { unique: true, sparse: true });
+                await database.collection("api_keys").createIndex({ key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
+                await database.collection("api_keys").createIndex({ isActive: 1 });
+                await database.collection("invalid_api_attempts").createIndex({ timestamp: -1 });
+                await database.collection("invalid_api_attempts").createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
+                await database.collection("invalid_api_attempts").createIndex({ reason: 1 });
+                await database.collection("thumbnails").createIndex({ collection: 1, docId: 1, idx: 1 }, { unique: true });
+                await database.collection("thumbnails").createIndex({ createdAt: -1 });
+                // Health collections indexes
+                await database.collection("hourlyhealthreport").createIndex({ timestamp: -1 }).catch(()=>{});
+                await database.collection("hourlyhealthreport").createIndex({ createdAt: -1 }).catch(()=>{});
+                await database.collection("notion_video").createIndex({ timestamp: -1 }).catch(()=>{});
+                console.log("✅ Atlas indexes ensured");
+            } catch (e) { console.warn("Index ensure warn:", e.message); }
+            // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
+            try {
+                const col = database.collection("api_keys");
+                const plaintextKeys = await col.find({ key: { $regex: "^dyn_" } }).limit(50).toArray();
+                for (const doc of plaintextKeys) {
+                    if (doc.key && !isHashedKey(doc.key) && !doc.keyHash) {
+                        const hashed = hashApiKey(doc.key);
+                        const preview = doc.keyPreview || maskKey(doc.key);
+                        const exists = await col.findOne({ keyHash: hashed });
+                        if (exists) continue;
+                        await col.updateOne({ _id: doc._id }, { $set: { keyHash: hashed, key: hashed, keyPreview: preview, migratedAt: new Date() } });
+                        console.log(`🔐 auto-migrated key ${doc._id} ${preview}`);
+                    }
+                }
+                if (plaintextKeys.length) console.log(`✅ auto-migration checked ${plaintextKeys.length} plaintext keys`);
+            } catch (e) { console.warn("auto-migrate warn:", e.message); }
+
+            global._mongoDb = database;
+            db = database;
+            return database;
+        }).catch((e) => {
+            console.error("❌ MongoDB Atlas connection failed:", e.message);
+            global._mongoPromise = null; // reset so next call retries
+            throw e;
+        });
+    }
+    db = await global._mongoPromise;
+    global._mongoDb = db;
     return db;
 }
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+    try { if (global._mongoClient) await global._mongoClient.close(); } catch {}
+    process.exit(0);
+});
+process.on("SIGTERM", async () => {
+    try { if (global._mongoClient) await global._mongoClient.close(); } catch {}
+});
 
 // ==================== KIRA AI (OpenAI compatible) ====================
 let kiraClient = null;
@@ -639,14 +706,63 @@ function sendError(res, err, fallback = "Internal server error", code = 500) {
 app.get("/", (req, res) => {
     res.json({
         success: true,
-        service: "Dynamic API v2",
+        service: "Dynamic API v2 — MongoDB Atlas (tally)",
+        atlas: {
+            uriHost: (process.env.MONGODB_URI||"").split("@")[1]?.split("/")[0] || "not-set",
+            dbName: process.env.DATABASE_NAME || "from-URI (tally)",
+            configured: !!process.env.MONGODB_URI && !process.env.MONGODB_URI.includes("user:pass")
+        },
         kira: { baseURL: KIRA_BASE_URL, defaultModel: KIRA_MODEL },
         adminPanel: normalizedAdminBase,
         docs: "Use X-API-Key header for /api/* . Get key via admin panel OTP."
     });
 });
-app.get("/health", (req, res) => {
-    res.json({ success: true, status: "ok", uptime: process.uptime(), env: NODE_ENV });
+app.get("/health", async (req, res) => {
+    // Atlas-aware health: ping DB
+    let dbStatus = "unknown";
+    let dbName = null;
+    let latencyMs = null;
+    try {
+        const start = Date.now();
+        const database = await getDB();
+        await database.command({ ping: 1 });
+        latencyMs = Date.now() - start;
+        dbStatus = "connected";
+        dbName = database.databaseName;
+    } catch (e) {
+        dbStatus = "error: " + e.message;
+    }
+    res.json({
+        success: true,
+        status: dbStatus === "connected" ? "ok" : "degraded",
+        uptime: process.uptime(),
+        env: NODE_ENV,
+        atlas: { status: dbStatus, dbName, latencyMs, uriConfigured: !!process.env.MONGODB_URI },
+        timestamp: new Date().toISOString()
+    });
+});
+// Detailed Atlas diagnostics (protected by admin token or api key)
+app.get("/health/atlas", async (req, res) => {
+    try {
+        const database = await getDB();
+        const start = Date.now();
+        await database.command({ ping: 1 });
+        const pingMs = Date.now() - start;
+        const stats = await database.command({ dbStats: 1 }).catch(()=>null);
+        const cols = await database.listCollections().toArray().catch(()=>[]);
+        res.json({
+            success: true,
+            atlas: {
+                pingMs,
+                dbName: database.databaseName,
+                host: (process.env.MONGODB_URI||"").split("@")[1]?.split("?")[0] || "unknown",
+                collections: cols.map(c=>c.name),
+                stats: stats ? { dataSize: stats.dataSize, storageSize: stats.storageSize, collections: stats.collections, objects: stats.objects } : null
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, atlas: { status: "error", message: e.message } });
+    }
 });
 
 // ==================== ADMIN PANEL & OTP ====================
