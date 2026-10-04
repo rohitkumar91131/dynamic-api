@@ -11,6 +11,9 @@ const { v4: uuidv4 } = require("uuid");
 const { MongoClient, ObjectId } = require("mongodb");
 const OpenAI = require("openai");
 const nodemailer = require("nodemailer");
+const { spawn } = require("child_process");
+let ffmpegPath = null;
+try { ffmpegPath = require("ffmpeg-static"); } catch (e) { console.warn("⚠️ ffmpeg-static not installed - video thumbnails unavailable"); }
 let sharp = null;
 try { sharp = require("sharp"); } catch (e) { console.warn("⚠️ sharp not installed - thumbnails will be skipped until npm install"); }
 
@@ -389,6 +392,47 @@ function detectFileKind(buf, fileName, mimeHint) {
     return "other";
 }
 
+function isVideoThumbnailSource(url, fileName, mimeHint) {
+    let path = String(url || "").split("?")[0];
+    try { path = new URL(url).pathname; } catch {}
+    return String(mimeHint || "").toLowerCase().startsWith("video/") ||
+        detectFileKind(null, fileName, "") === "video" || detectFileKind(null, path, "") === "video";
+}
+
+function extractVideoFrame(url, timestamp = 0) {
+    if (!ffmpegPath) return Promise.reject(new Error("ffmpeg-static unavailable"));
+    let parsed;
+    try { parsed = new URL(url); } catch { return Promise.reject(new Error("Invalid video URL")); }
+    if (!["http:", "https:"].includes(parsed.protocol)) return Promise.reject(new Error("Invalid video URL protocol"));
+    return new Promise((resolve, reject) => {
+        const args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-ss", String(timestamp), "-i", url,
+            "-frames:v", "1", "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"];
+        const child = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+        const chunks = []; let bytes = 0, stderr = "", failure = null;
+        const timer = setTimeout(() => { failure = new Error("FFmpeg timed out"); child.kill("SIGKILL"); }, 15000);
+        child.stdout.on("data", chunk => {
+            if (failure) return;
+            bytes += chunk.length;
+            if (bytes > 10 * 1024 * 1024) { failure = new Error("Video frame too large"); child.kill("SIGKILL"); return; }
+            chunks.push(chunk);
+        });
+        child.stderr.on("data", chunk => { if (stderr.length < 4096) stderr += chunk.toString().slice(0, 4096 - stderr.length); });
+        child.on("error", error => { clearTimeout(timer); reject(error); });
+        child.on("close", code => {
+            clearTimeout(timer);
+            if (failure) return reject(failure);
+            if (code !== 0 || !bytes) return reject(new Error("FFmpeg frame extraction failed" + (stderr.trim() ? ": " + stderr.trim().replaceAll(url, "[video URL]") : "")));
+            resolve(Buffer.concat(chunks, bytes));
+        });
+    });
+}
+
+async function generateVideoWebpThumbnail(frameBuffer) {
+    const result = await generateWebpThumbnail(frameBuffer, "video-frame.jpg", "image/jpeg");
+    if (result.placeholder) throw new Error("Video frame could not be converted to WebP");
+    return { ...result, kind: "video" };
+}
+
 async function generatePlaceholderWebp(label, subLabel) {
     if (!sharp) throw new Error("sharp not available");
     const w = THUMB_WIDTH, h = Math.round(w * 0.66); // 320x211
@@ -483,21 +527,32 @@ async function processThumbnailsForDoc(collection, docId, data) {
     for (let idx = 0; idx < images.length; idx++) {
         const img = images[idx];
         try {
-            // fetch original (tally private url) - 10s timeout, 8mb max (images) / 15mb for video/pdf
-            const controller = new AbortController();
-            const t = setTimeout(()=>controller.abort(), 15000);
-            let origBuf; let contentType = img.mimeType || "";
-            try {
-                const r = await fetch(img.url, { signal: controller.signal });
-                if (!r.ok) throw new Error(`fetch ${r.status}`);
-                contentType = r.headers.get("content-type") || contentType;
-                const ab = await r.arrayBuffer();
-                // video/pdf may be larger, allow 15mb for fetch but still thumb is 25kb
-                const limit = contentType.startsWith("video/") || contentType==="application/pdf" ? 15*1024*1024 : 8*1024*1024;
-                if (ab.byteLength > limit) throw new Error("file too large");
-                origBuf = Buffer.from(ab);
-            } finally { clearTimeout(t); }
-            const { buffer: webpBuf, quality, size, kind, placeholder } = await generateWebpThumbnail(origBuf, img.name, contentType);
+            let origBuf; let contentType = img.mimeType || ""; let thumbResult;
+            if (isVideoThumbnailSource(img.url, img.name, contentType)) {
+                origBuf = await extractVideoFrame(img.url);
+                thumbResult = await generateVideoWebpThumbnail(origBuf);
+            } else {
+                // Keep the existing fetch path for images/PDF/other files.
+                const controller = new AbortController();
+                const t = setTimeout(()=>controller.abort(), 15000);
+                try {
+                    const r = await fetch(img.url, { signal: controller.signal });
+                    if (!r.ok) throw new Error(`fetch ${r.status}`);
+                    contentType = r.headers.get("content-type") || contentType;
+                    if (isVideoThumbnailSource(img.url, img.name, contentType)) {
+                        if (r.body) await r.body.cancel().catch(()=>{});
+                        origBuf = await extractVideoFrame(img.url);
+                        thumbResult = await generateVideoWebpThumbnail(origBuf);
+                    } else {
+                        const ab = await r.arrayBuffer();
+                        const limit = contentType==="application/pdf" ? 15*1024*1024 : 8*1024*1024;
+                        if (ab.byteLength > limit) throw new Error("file too large");
+                        origBuf = Buffer.from(ab);
+                        thumbResult = await generateWebpThumbnail(origBuf, img.name, contentType);
+                    }
+                } finally { clearTimeout(t); }
+            }
+            const { buffer: webpBuf, quality, size, kind, placeholder } = thumbResult;
             console.log(`🖼️ thumb ${docId}[${idx}] kind=${kind} ${origBuf.length} -> ${size} bytes q=${quality} webp${placeholder?" (placeholder)":""}`);
 
             // upload to telegram (optional) - always photo (webp placeholder for video/pdf too)
@@ -1848,11 +1903,23 @@ app.get("/api/thumbnail", globalLimiter, async (req, res) => {
     const url = String(req.query.url || "").trim();
     if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ success:false, message:"Missing ?url=https://..." });
     if (!sharp) return res.status(503).json({ success:false, message:"sharp missing" });
-    const r = await fetch(url);
-    if (!r.ok) return res.status(502).json({ success:false, message:"fetch original failed "+r.status });
-    const buf = Buffer.from(await r.arrayBuffer());
-    const ct = r.headers.get("content-type") || "";
-    const { buffer: webpBuf, size, quality, kind } = await generateWebpThumbnail(buf, url.split("/").pop() || "image.jpg", ct);
+    const fileName = url.split("/").pop() || "image.jpg";
+    let thumbResult;
+    if (isVideoThumbnailSource(url, fileName, "")) {
+      thumbResult = await generateVideoWebpThumbnail(await extractVideoFrame(url));
+    } else {
+      const r = await fetch(url);
+      if (!r.ok) return res.status(502).json({ success:false, message:"fetch original failed "+r.status });
+      const ct = r.headers.get("content-type") || "";
+      if (isVideoThumbnailSource(url, fileName, ct)) {
+        if (r.body) await r.body.cancel().catch(()=>{});
+        thumbResult = await generateVideoWebpThumbnail(await extractVideoFrame(url));
+      } else {
+        const buf = Buffer.from(await r.arrayBuffer());
+        thumbResult = await generateWebpThumbnail(buf, fileName, ct);
+      }
+    }
+    const { buffer: webpBuf, size, quality, kind } = thumbResult;
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     res.setHeader("Content-Type", "image/webp");
@@ -2002,13 +2069,25 @@ async function serveThumb(req, res) {
             const images = extractTallyImages(doc.data);
             if (!images[idx]) return res.status(404).json({ success: false, message: "No image at idx " + idx });
             if (!sharp) return res.status(503).json({ success: false, message: "Thumbnail service unavailable (sharp missing)" });
-            // generate now (sync, ~300ms) - handles image/video/pdf/other via placeholder
+            // Generate the missing thumbnail on demand.
             try {
-                const r = await fetch(images[idx].url);
-                if (!r.ok) return res.status(502).json({ success: false, message: "Failed to fetch original" });
-                const buf = Buffer.from(await r.arrayBuffer());
-                const ct = r.headers.get("content-type") || images[idx].mimeType || "";
-                const { buffer: webpBuf, size, quality, kind, placeholder } = await generateWebpThumbnail(buf, images[idx].name, ct);
+                const image = images[idx];
+                let ct = image.mimeType || "", thumbResult;
+                if (isVideoThumbnailSource(image.url, image.name, ct)) {
+                    thumbResult = await generateVideoWebpThumbnail(await extractVideoFrame(image.url));
+                } else {
+                    const r = await fetch(image.url);
+                    if (!r.ok) return res.status(502).json({ success: false, message: "Failed to fetch original" });
+                    ct = r.headers.get("content-type") || ct;
+                    if (isVideoThumbnailSource(image.url, image.name, ct)) {
+                        if (r.body) await r.body.cancel().catch(()=>{});
+                        thumbResult = await generateVideoWebpThumbnail(await extractVideoFrame(image.url));
+                    } else {
+                        const buf = Buffer.from(await r.arrayBuffer());
+                        thumbResult = await generateWebpThumbnail(buf, image.name, ct);
+                    }
+                }
+                const { buffer: webpBuf, size, quality, kind, placeholder } = thumbResult;
                 thumb = { buffer: webpBuf, mimeType: "image/webp", thumbSize: size, quality, kind };
                 const tg = await uploadToTelegram(webpBuf, `${collection}/${id} #${idx} [${kind}] on-demand ${size}B${placeholder?" placeholder":""}`);
                 await database.collection("thumbnails").updateOne(
