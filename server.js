@@ -311,7 +311,14 @@ function extractNotes(data) {
     if (data && data.fields && Array.isArray(data.fields)) {
         text = data.fields.map(f => {
             const label = sanitizeString(String(f.label || ""), 200);
-            const value = sanitizeString(String(f.value || ""), 500);
+            let rawVal = f.value;
+            if (Array.isArray(rawVal)) {
+                // FILE_UPLOAD / multi-choice: file names/ids instead of [object Object]
+                rawVal = rawVal.map(v => (v && typeof v === "object" ? (v.name || v.url || v.text || "") : String(v ?? ""))).filter(Boolean).join(", ");
+            } else if (rawVal && typeof rawVal === "object") {
+                try { rawVal = JSON.stringify(rawVal).slice(0, 500); } catch { rawVal = ""; }
+            }
+            const value = sanitizeString(String(rawVal ?? ""), 500);
             return `${label}: ${value}`;
         }).join(", ");
     } else if (typeof data === "string") {
@@ -1726,53 +1733,32 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
         if (["api_keys","otps","admin_sessions"].includes(collection)) {
             return res.status(403).json({ success: false, message: "Forbidden collection" });
         }
-        // Whitelist: only allow `data` field from client, ignore everything else (fixes mass assignment)
+        // Tally "Test webhook" / verification ping (no data payload) — ack 200 so Tally shows green
         if (!req.body || typeof req.body.data === "undefined") {
+            if (!req.body || req.body.eventType || req.body.eventId || req.body.event || req.body.hook || Object.keys(req.body).length === 0) {
+                console.log(`🤝 webhook ping for ${collection} from ${getClientIp(req)} — ack without save`);
+                return res.json({ success: true, message: "Webhook endpoint active. Send FORM_RESPONSE with data to save." });
+            }
             return res.status(400).json({ success: false, message: "data field required in body {data: ...}" });
         }
-        // Validate data size after sanitization
+        // Validate data size after sanitization (Tally full payloads with files can be large)
         const rawData = req.body.data;
         // quick size check
         const jsonLen = JSON.stringify(rawData).length;
-        if (jsonLen > 20000) return res.status(400).json({ success: false, message: "data too large (max 20kb stringified)" });
+        if (jsonLen > 200000) return res.status(400).json({ success: false, message: "data too large (max 200kb stringified)" });
 
-        const extractedText = extractNotes(rawData);
+        let extractedText = extractNotes(rawData);
+        if (!extractedText && req.body.eventType) {
+            // Tally test event with empty fields — ack green without saving junk
+            console.log(`🤝 empty Tally ${req.body.eventType} for ${collection} from ${getClientIp(req)} — ack without save`);
+            return res.json({ success: true, message: "Webhook endpoint active. Empty test event acknowledged." });
+        }
         if (!extractedText) return res.status(400).json({ success: false, message: "No extractable notes found" });
 
-        // Kira dynamic: allow per-request model override via headers or body._kira
-        const tagModel = sanitizeString(String(req.body._kiraModel || req.headers["x-kira-model"] || KIRA_MODEL), 100) || KIRA_MODEL;
-        const customTagPrompt = req.body._kiraTagPrompt ? sanitizeString(String(req.body._kiraTagPrompt), 3000) : null;
-        const customAnalysisPrompt = req.body._kiraAnalysisPrompt ? sanitizeString(String(req.body._kiraAnalysisPrompt), 5000) : null;
-
+        // AI disabled for now (Kira wallet empty - 402) — save directly, no tag/analysis calls
+        const tagModel = "disabled";
         let aiTags = "";
         let aiAnalysis = "";
-
-        // Only call Kira if key configured, else save without AI
-        if (KIRA_API_KEY) {
-            try {
-                const tagSystem = customTagPrompt || DEFAULT_TAG_PROMPT;
-                const analysisSystem = customAnalysisPrompt || DEFAULT_ANALYSIS_PROMPT;
-                const tagPromise = callKiraChat([
-                    { role: "system", content: tagSystem },
-                    { role: "user", content: `Log: ${extractedText}` }
-                ], tagModel);
-                const analysisPromise = callKiraChat([
-                    { role: "system", content: analysisSystem },
-                    { role: "user", content: `Log: ${extractedText}` }
-                ], tagModel);
-
-                const [tagsResult, analysisResult] = await Promise.allSettled([tagPromise, analysisPromise]);
-                if (tagsResult.status === "fulfilled") aiTags = xss(String(tagsResult.value).slice(0, 500));
-                else console.error("Kira tag failed:", tagsResult.reason?.message);
-
-                if (analysisResult.status === "fulfilled") aiAnalysis = xss(String(analysisResult.value).slice(0, 8000));
-                else console.error("Kira analysis failed:", analysisResult.reason?.message);
-            } catch (aiError) {
-                console.error("Critical Kira failure (saving anyway):", aiError.message);
-            }
-        } else {
-            console.warn("Skipping Kira AI - KIRA_API_KEY missing");
-        }
 
         // Sanitized save - no spread, whitelist only
         const sanitizedData = JSON.parse(JSON.stringify(rawData)); // deep clone
@@ -1810,7 +1796,7 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
             success: true,
             insertedId: result.insertedId,
             tags: aiTags,
-            ai_analysis: aiAnalysis ? "Generated" : (KIRA_API_KEY ? "Failed" : "Skipped (no KIRA_API_KEY)"),
+            ai_analysis: "Skipped (AI disabled)",
             modelUsed: tagModel,
             thumbnails: thumbResult?.results || []
         });
