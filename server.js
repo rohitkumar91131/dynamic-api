@@ -69,14 +69,17 @@ if (CORS_ORIGIN) {
         allowedHeaders: ["Content-Type","Authorization","X-API-Key","X-Admin-Token"]
     };
 } else {
-    // Personal use: default restrictive - same-origin + localhost, not wildcard star echo? but for dev allow all with warning
-    if (isProd) console.warn("⚠️  CORS_ORIGIN not set in production - defaulting to deny all cross-origin. Set CORS_ORIGIN env.");
+    // Personal hobby API (Tally webhooks + health frontend + Supabase): reflect origin
+    // when CORS_ORIGIN is unset. Logged ONCE at startup — not per request.
+    if (isProd) console.log("ℹ️ CORS_ORIGIN not set — reflecting all origins (hobby mode). Set CORS_ORIGIN env to restrict.");
     corsOptions = {
-        origin: isProd ? false : true,
-        credentials: true
+        origin: true,
+        credentials: true,
+        methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
+        allowedHeaders: ["Content-Type","Authorization","X-API-Key","X-Admin-Token"]
     };
 }
-app.use(cors());
+app.use(cors(corsOptions));
 
 // Body limit reduced from 50mb -> 1mb to prevent DoS
 app.use(express.json({ limit: "1mb" }));
@@ -183,24 +186,34 @@ async function getDB() {
             } catch (e) {
                 console.warn("⚠️ Atlas ping failed:", e.message);
             }
-            // Ensure indexes (idempotent)
-            try {
-                await database.collection("otps").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-                await database.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-                await database.collection("api_keys").createIndex({ keyHash: 1 }, { unique: true, sparse: true });
-                await database.collection("api_keys").createIndex({ key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
-                await database.collection("api_keys").createIndex({ isActive: 1 });
-                await database.collection("invalid_api_attempts").createIndex({ timestamp: -1 });
-                await database.collection("invalid_api_attempts").createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
-                await database.collection("invalid_api_attempts").createIndex({ reason: 1 });
-                await database.collection("thumbnails").createIndex({ collection: 1, docId: 1, idx: 1 }, { unique: true });
-                await database.collection("thumbnails").createIndex({ createdAt: -1 });
-                // Health collections indexes
-                await database.collection("hourlyhealthreport").createIndex({ timestamp: -1 }).catch(()=>{});
-                await database.collection("hourlyhealthreport").createIndex({ createdAt: -1 }).catch(()=>{});
-                await database.collection("notion_video").createIndex({ timestamp: -1 }).catch(()=>{});
-                console.log("✅ Atlas indexes ensured");
-            } catch (e) { console.warn("Index ensure warn:", e.message); }
+            // Ensure indexes (idempotent) — per-index try/catch so an existing
+            // index with same name but different options (code 85/86) stays silent
+            // instead of spamming "Index ensure warn" on every cold start.
+            const safeIndex = async (col, keys, opts) => {
+                try {
+                    await database.collection(col).createIndex(keys, opts);
+                } catch (e) {
+                    // 85=IndexOptionsConflict, 86=IndexKeySpecsConflict → already exists, fine
+                    if (e.code === 85 || e.code === 86 || /already exists|same name/i.test(e.message || "")) return;
+                    console.warn(`Index ensure warn [${col}]:`, e.message);
+                }
+            };
+            await safeIndex("otps", { expiresAt: 1 }, { expireAfterSeconds: 0 });
+            await safeIndex("admin_sessions", { expiresAt: 1 }, { expireAfterSeconds: 0 });
+            await safeIndex("api_keys", { keyHash: 1 }, { unique: true, sparse: true });
+            await safeIndex("api_keys", { key: 1 }, { unique: true, sparse: true }); // legacy, kept for migration period
+            await safeIndex("api_keys", { isActive: 1 });
+            await safeIndex("invalid_api_attempts", { timestamp: -1 });
+            await safeIndex("invalid_api_attempts", { reason: 1 });
+            await safeIndex("invalid_api_attempts", { timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // TTL 30 days
+            await safeIndex("thumbnails", { collection: 1, docId: 1, idx: 1 }, { unique: true });
+            await safeIndex("thumbnails", { createdAt: -1 });
+            // Health collections indexes
+            await safeIndex("hourlyhealthreport", { timestamp: -1 });
+            await safeIndex("hourlyhealthreport", { createdAt: -1 });
+            await safeIndex("hourlyhealthreport", { thumbFailed: 1 });
+            await safeIndex("notion_video", { timestamp: -1 });
+            console.log("✅ Atlas indexes ensured");
             // Auto-migrate existing plaintext keys to hashed on boot (idempotent, for build-time safety)
             try {
                 const col = database.collection("api_keys");
@@ -501,7 +514,7 @@ async function uploadToTelegram(webpBuffer, caption = "") {
         form.append("photo", blob, "thumb.webp");
         if (caption) form.append("caption", String(caption).slice(0, 900));
         const controller = new AbortController();
-        const t = setTimeout(()=>controller.abort(), 15000);
+        const t = setTimeout(()=>controller.abort(), 8000);
         try {
             const res = await fetch(url, { method: "POST", body: form, signal: controller.signal });
             const j = await res.json().catch(()=>null);
@@ -525,82 +538,133 @@ async function uploadToTelegram(webpBuffer, caption = "") {
     }
 }
 
-async function processThumbnailsForDoc(collection, docId, data) {
+// Single file thumbnail attempt — throws on failure so caller can retry (one-by-one order kept)
+// DB-first: thumbnail saved to Mongo BEFORE telegram upload, so even if telegram is
+// slow/down the thumb is still available via /thumb proxy. Telegram is best-effort.
+async function processOneThumb(database, collection, docId, img, idx) {
+    let origBuf; let contentType = img.mimeType || ""; let thumbResult;
+    if (isVideoThumbnailSource(img.url, img.name, contentType)) {
+        origBuf = await extractVideoFrame(img.url);
+        thumbResult = await generateVideoWebpThumbnail(origBuf);
+    } else {
+        // Keep the existing fetch path for images/PDF/other files.
+        const controller = new AbortController();
+        const t = setTimeout(()=>controller.abort(), 10000);
+        try {
+            const r = await fetch(img.url, { signal: controller.signal });
+            if (!r.ok) throw new Error(`fetch ${r.status}`);
+            contentType = r.headers.get("content-type") || contentType;
+            if (isVideoThumbnailSource(img.url, img.name, contentType)) {
+                if (r.body) await r.body.cancel().catch(()=>{});
+                origBuf = await extractVideoFrame(img.url);
+                thumbResult = await generateVideoWebpThumbnail(origBuf);
+            } else {
+                const ab = await r.arrayBuffer();
+                const limit = contentType==="application/pdf" ? 15*1024*1024 : 8*1024*1024;
+                if (ab.byteLength > limit) throw new Error("file too large");
+                origBuf = Buffer.from(ab);
+                thumbResult = await generateWebpThumbnail(origBuf, img.name, contentType);
+            }
+        } finally { clearTimeout(t); }
+    }
+    const { buffer: webpBuf, quality, size, kind, placeholder } = thumbResult;
+    console.log(`🖼️ thumb ${docId}[${idx}] kind=${kind} ${origBuf.length} -> ${size} bytes q=${quality} webp${placeholder?" (placeholder)":""}`);
+
+    // 1) Save to DB FIRST (fast, critical path) — thumb proxy works even if telegram fails
+    const thumbDoc = {
+        collection,
+        docId: new ObjectId(docId),
+        idx,
+        origUrl: img.url,
+        origName: img.name,
+        origMime: contentType,
+        kind, // image | video | pdf | audio | other | placeholder
+        isPlaceholder: !!placeholder,
+        createdAt: new Date(),
+        thumbSize: size,
+        thumbWidth: THUMB_WIDTH,
+        quality,
+        mimeType: "image/webp",
+        buffer: webpBuf,
+        telegram: null
+    };
+    await database.collection("thumbnails").updateOne(
+        { collection, docId: new ObjectId(docId), idx },
+        { $set: thumbDoc },
+        { upsert: true }
+    );
+    // 2) Telegram upload best-effort (never throws, never blocks thumb availability)
+    let tg = null;
+    try {
+        tg = await uploadToTelegram(webpBuf, `${collection}/${docId} #${idx} [${kind}] ${img.name} ${size}B q${quality}${placeholder?" placeholder":""}`);
+        if (tg) {
+            await database.collection("thumbnails").updateOne(
+                { collection, docId: new ObjectId(docId), idx },
+                { $set: { telegram: { file_id: tg.file_id, file_unique_id: tg.file_unique_id, message_id: tg.message_id } } }
+            ).catch(()=>{});
+        }
+    } catch { /* telegram optional — ignore */ }
+    return { idx, size, quality, kind, placeholder: !!placeholder, telegram_file_id: tg?.file_id || null };
+}
+
+const THUMB_RETRIES = 3; // per-file attempts (one-by-one, backoff between tries)
+
+async function processThumbnailsForDoc(collection, docId, data, opts = {}) {
     const images = extractTallyImages(data);
     if (!images.length) return { processed: 0 };
     if (!sharp) { console.warn("sharp missing - skip thumbnail for", docId); return { processed: 0, skipped: true }; }
     const database = await getDB();
+    // retryOnlyFailed: skip idxs that already have a cached thumb in DB (used by retry endpoint)
+    let skipIdx = new Set();
+    if (opts.retryOnlyFailed) {
+        try {
+            const existing = await database.collection("thumbnails")
+                .find({ collection, docId: new ObjectId(docId) }).project({ idx: 1 }).toArray();
+            for (const t of existing) skipIdx.add(t.idx);
+        } catch {}
+    }
     const results = [];
     for (let idx = 0; idx < images.length; idx++) {
-        const img = images[idx];
-        try {
-            let origBuf; let contentType = img.mimeType || ""; let thumbResult;
-            if (isVideoThumbnailSource(img.url, img.name, contentType)) {
-                origBuf = await extractVideoFrame(img.url);
-                thumbResult = await generateVideoWebpThumbnail(origBuf);
-            } else {
-                // Keep the existing fetch path for images/PDF/other files.
-                const controller = new AbortController();
-                const t = setTimeout(()=>controller.abort(), 15000);
-                try {
-                    const r = await fetch(img.url, { signal: controller.signal });
-                    if (!r.ok) throw new Error(`fetch ${r.status}`);
-                    contentType = r.headers.get("content-type") || contentType;
-                    if (isVideoThumbnailSource(img.url, img.name, contentType)) {
-                        if (r.body) await r.body.cancel().catch(()=>{});
-                        origBuf = await extractVideoFrame(img.url);
-                        thumbResult = await generateVideoWebpThumbnail(origBuf);
-                    } else {
-                        const ab = await r.arrayBuffer();
-                        const limit = contentType==="application/pdf" ? 15*1024*1024 : 8*1024*1024;
-                        if (ab.byteLength > limit) throw new Error("file too large");
-                        origBuf = Buffer.from(ab);
-                        thumbResult = await generateWebpThumbnail(origBuf, img.name, contentType);
-                    }
-                } finally { clearTimeout(t); }
-            }
-            const { buffer: webpBuf, quality, size, kind, placeholder } = thumbResult;
-            console.log(`🖼️ thumb ${docId}[${idx}] kind=${kind} ${origBuf.length} -> ${size} bytes q=${quality} webp${placeholder?" (placeholder)":""}`);
-
-            // upload to telegram (optional) - always photo (webp placeholder for video/pdf too)
-            const tg = await uploadToTelegram(webpBuf, `${collection}/${docId} #${idx} [${kind}] ${img.name} ${size}B q${quality}${placeholder?" placeholder":""}`);
-            // store in dedicated thumbnails collection for fast proxy (binary)
-            const thumbDoc = {
-                collection,
-                docId: new ObjectId(docId),
-                idx,
-                origUrl: img.url,
-                origName: img.name,
-                origMime: contentType,
-                kind, // image | video | pdf | audio | other | placeholder
-                isPlaceholder: !!placeholder,
-                createdAt: new Date(),
-                thumbSize: size,
-                thumbWidth: THUMB_WIDTH,
-                quality,
-                mimeType: "image/webp",
-                buffer: webpBuf,
-                telegram: tg ? { file_id: tg.file_id, file_unique_id: tg.file_unique_id, message_id: tg.message_id } : null
-            };
-            await database.collection("thumbnails").updateOne(
-                { collection, docId: new ObjectId(docId), idx },
-                { $set: thumbDoc },
-                { upsert: true }
-            );
-            results.push({ idx, size, quality, kind, placeholder: !!placeholder, telegram_file_id: tg?.file_id || null });
-        } catch (e) {
-            console.warn(`thumb fail ${docId}[${idx}]`, e.message);
-            results.push({ idx, error: e.message });
+        if (skipIdx.has(idx)) {
+            results.push({ idx, cached: true, skipped: true });
+            continue;
         }
+        const img = images[idx];
+        let done = false, lastErr = null;
+        for (let attempt = 1; attempt <= THUMB_RETRIES && !done; attempt++) {
+            try {
+                if (attempt > 1) console.log(`🔁 retry thumb ${docId}[${idx}] try ${attempt}/${THUMB_RETRIES}`);
+                results.push(await processOneThumb(database, collection, docId, img, idx));
+                done = true;
+            } catch (e) {
+                lastErr = e;
+                console.warn(`thumb fail ${docId}[${idx}] try ${attempt}/${THUMB_RETRIES}:`, e.message);
+                if (attempt < THUMB_RETRIES) await new Promise(r => setTimeout(r, 500 * attempt));
+            }
+        }
+        if (!done) results.push({ idx, error: String(lastErr?.message || lastErr), attempts: THUMB_RETRIES, retryable: true });
     }
-    // update original doc with thumbRefs array (no binary, just refs)
+    // update original doc with thumbRefs array (no binary, just refs) + retry flag for backfill
+    // merge with previous results so retry keeps old successes
+    let merged = results;
+    if (opts.retryOnlyFailed && Array.isArray(opts.prevResults) && opts.prevResults.length) {
+        const byIdx = new Map(opts.prevResults.map(r => [r.idx, r]));
+        for (const r of results) {
+            if (!r.skipped) byIdx.set(r.idx, r);
+        }
+        merged = [...byIdx.values()].sort((a, b) => a.idx - b.idx);
+    }
+    const failedCount = merged.filter(r => r.error && !r.skipped).length;
     try {
+        const setDoc = { thumbnails: merged, thumbnailAt: new Date(), thumbFailed: failedCount > 0 };
+        if (failedCount > 0) setDoc.thumbFailedAt = new Date();
+        else setDoc.thumbRecoveredAt = new Date();
         await database.collection(collection).updateOne(
             { _id: new ObjectId(docId) },
-            { $set: { thumbnails: results, thumbnailAt: new Date() } }
+            { $set: setDoc }
         );
     } catch {}
-    return { processed: results.length, results };
+    return { processed: results.filter(r => !r.skipped).length, failed: failedCount, skipped: results.filter(r => r.skipped).length, results: merged };
 }
 
 // Kira call with timeout + sanitization
@@ -803,6 +867,8 @@ app.get("/health", async (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
+// Favicon — silent 204 so Vercel logs aren't spammed with GET /favicon.ico 404
+app.get("/favicon.ico", (req, res) => res.status(204).end());
 // Detailed Atlas diagnostics (protected by admin token or api key)
 app.get("/health/atlas", async (req, res) => {
     try {
@@ -1382,35 +1448,34 @@ app.post(`${normalizedAdminBase}/backfill-thumbnails`, requireAdminAuth, async (
         const limit = Math.min(200, Math.max(1, parseInt(req.body?.limit || "20", 10)));
         const dryRun = !!req.body?.dryRun;
         const database = await getDB();
-        // Find docs that have FILE_UPLOAD but no thumbnails yet (or thumbnails empty)
-        const candidates = await database.collection(collection).find({
+        // Find docs that have FILE_UPLOAD but no thumbnails yet, empty, pending, or FAILED (thumbFailed)
+        const pendingFilter = {
             $and: [
                 { "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } } },
-                { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ] }
+                { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] }
             ]
-        }).sort({ createdAt: -1 }).limit(limit).toArray();
+        };
+        const candidates = await database.collection(collection).find(pendingFilter).sort({ createdAt: -1 }).limit(limit).toArray();
         if (dryRun) {
             return res.json({ success: true, dryRun: true, found: candidates.length, sampleIds: candidates.slice(0,5).map(c=>c._id) });
         }
         let processed = 0, failed = 0, details = [];
         for (const doc of candidates) {
             try {
-                const r = await processThumbnailsForDoc(collection, doc._id, doc.data);
+                // retryOnlyFailed: only create missing thumbs, keep existing successes
+                const r = await processThumbnailsForDoc(collection, doc._id, doc.data, { retryOnlyFailed: true, prevResults: doc.thumbnails });
                 processed++;
-                details.push({ id: doc._id, processed: r.processed, results: r.results });
+                details.push({ id: doc._id, processed: r.processed, failed: r.failed, skipped: r.skipped, results: r.results });
+                if (r.failed) failed++;
             } catch (e) {
                 failed++;
                 details.push({ id: doc._id, error: e.message });
             }
-            await new Promise(r=>setTimeout(r, 300));
             // small delay to avoid hammering
             await new Promise(r=>setTimeout(r, 300));
         }
         // also count remaining
-        const remaining = await database.collection(collection).countDocuments({
-            "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } },
-            $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ]
-        });
+        const remaining = await database.collection(collection).countDocuments(pendingFilter);
         res.json({ success: true, processed, failed, remaining, details: details.slice(0,20) });
     } catch (e) { sendError(res, e); }
 });
@@ -1711,7 +1776,7 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
 
     if (PUBLIC_COLLECTIONS.has(colCheck)) {
         // Public webhook collections — fully open, NO token required (Tally sends no key)
-        console.warn(`⚠️ public POST ${colCheck} from ${getClientIp(req)} - open mode, no token`);
+        console.log(`📥 public POST ${colCheck} from ${getClientIp(req)} - open mode, no token`);
         return next();
     }
     return requireApiKey(req, res, next);
@@ -1765,21 +1830,28 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
         };
 
         const database = await getDB();
+        const thumbCount = extractTallyImages(sanitizedData).length;
+        if (thumbCount > 0) {
+            // mark pending BEFORE insert so retry/backfill can find it even if instance dies
+            dataToSave.thumbPending = true;
+            dataToSave.thumbFailed = false;
+        }
         const result = await database.collection(collection).insertOne(dataToSave);
 
-        // Generate 25kb webp + Telegram at NEW ENTRY time (await, not fire-and-forget - Vercel kills background)
-        let thumbResult = null;
-        try {
-            // 4s timeout so Tally webhook doesn't hang
-            thumbResult = await Promise.race([
-                processThumbnailsForDoc(collection, result.insertedId, sanitizedData),
-                new Promise((_, rej) => setTimeout(() => rej(new Error("thumb timeout 4s")), 4000))
-            ]);
-            if (thumbResult?.processed) console.log(`✅ thumbnails at insert for ${collection}/${result.insertedId}:`, thumbResult.results);
-        } catch (e) {
-            console.warn(`⚠️ thumb at insert failed/timeout for ${result.insertedId}:`, e.message);
-            // fallback: fire-and-forget for remaining (if timeout)
-            setImmediate(() => processThumbnailsForDoc(collection, result.insertedId, sanitizedData).catch(()=>{}));
+        // Respond to Tally IMMEDIATELY (fast ack, no timeout). Thumbnails generate in
+        // background and are saved to `thumbnails` collection; failures set thumbFailed
+        // flag which the retry endpoint / backfill picks up. Frontend uses on-demand
+        // /thumb proxy (thumbPending) until background finishes.
+        const docIdStr = String(result.insertedId);
+        if (thumbCount > 0) {
+            setImmediate(() => {
+                processThumbnailsForDoc(collection, result.insertedId, sanitizedData)
+                    .then(r => {
+                        if (r.processed) console.log(`✅ thumbnails background for ${collection}/${docIdStr}: ok=${r.processed - r.failed} failed=${r.failed}`);
+                        else if (r.failed) console.warn(`⚠️ thumbnails background for ${collection}/${docIdStr}: all failed, retryable via /api/${collection}/${docIdStr}/retry-thumbs`);
+                    })
+                    .catch(e => console.warn(`⚠️ thumbnails background error for ${docIdStr}:`, e.message));
+            });
         }
 
         res.status(201).json({
@@ -1788,9 +1860,59 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
             tags: aiTags,
             ai_analysis: "Skipped (AI disabled)",
             modelUsed: tagModel,
-            thumbnails: thumbResult?.results || []
+            thumbnails: [],
+            thumbPending: thumbCount > 0,
+            thumbCount,
+            thumbRetryUrl: thumbCount > 0 ? `/api/${collection}/${docIdStr}/retry-thumbs` : undefined
         });
     } catch (err) { sendError(res, err, "Failed to create", 500); }
+});
+
+// 1.4 Retry thumbnails for a doc — creates+saves thumbs for failed/missing idxs only.
+// Public for public collections (hobby), else requires API key. Used when background
+// generation failed (thumbFailed:true) or instance died before finishing.
+async function handleRetryThumbs(req, res) {
+    try {
+        let collection = req.params.collection;
+        collection = normalizeCollection(collection);
+        const id = req.params.id;
+        if (!isValidCollection(collection)) return res.status(400).json({ success: false, message: "Invalid collection name" });
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: "Invalid id format" });
+        if (["api_keys","otps","admin_sessions","thumbnails"].includes(collection)) return res.status(403).json({ success: false, message: "Forbidden" });
+        const database = await getDB();
+        const doc = await database.collection(collection).findOne({ _id: new ObjectId(id) });
+        if (!doc) return res.status(404).json({ success: false, message: "Document not found" });
+        const images = extractTallyImages(doc.data);
+        if (!images.length) return res.status(404).json({ success: false, message: "No FILE_UPLOAD images in this doc" });
+        const existing = await database.collection("thumbnails").find({ collection, docId: new ObjectId(id) }).project({ idx: 1 }).toArray();
+        const doneIdx = new Set(existing.map(t => t.idx));
+        const missing = images.map((_, i) => i).filter(i => !doneIdx.has(i));
+        if (!missing.length) {
+            return res.json({ success: true, message: "All thumbnails already exist", total: images.length, missing: 0 });
+        }
+        console.log(`🔁 thumb retry ${collection}/${id}: missing idxs [${missing.join(",")}] of ${images.length}`);
+        const r = await processThumbnailsForDoc(collection, doc._id, doc.data, { retryOnlyFailed: true, prevResults: doc.thumbnails });
+        res.json({
+            success: true,
+            message: r.failed ? `Retry done: ${r.processed} processed, ${r.failed} still failing` : `Retry done: all thumbnails ready`,
+            total: images.length,
+            retried: missing.length,
+            failed: r.failed,
+            results: r.results,
+            thumbUrls: images.map((_, i) => `/api/${collection}/${id}/thumb?idx=${i}`)
+        });
+    } catch (e) { sendError(res, e, "Thumb retry failed"); }
+}
+app.post("/api/:collection/:id/retry-thumbs", globalLimiter, apiLimiter, async (req, res, next) => {
+    const colCheck = normalizeCollection(req.params.collection);
+    if (PUBLIC_COLLECTIONS.has(colCheck)) return handleRetryThumbs(req, res);
+    return requireApiKey(req, res, () => handleRetryThumbs(req, res));
+});
+// GET variant for easy browser/cron retry
+app.get("/api/:collection/:id/retry-thumbs", globalLimiter, apiLimiter, async (req, res, next) => {
+    const colCheck = normalizeCollection(req.params.collection);
+    if (PUBLIC_COLLECTIONS.has(colCheck)) return handleRetryThumbs(req, res);
+    return requireApiKey(req, res, () => handleRetryThumbs(req, res));
 });
 
 // 1.5 Burp Journal Sync - strict validation
@@ -1838,12 +1960,23 @@ app.post("/api/:collection/analyze/:id", requireApiKey, apiLimiter, async (req, 
         if (!extractedText) return res.status(400).json({ success: false, message: "No notes to analyze" });
 
         const model = sanitizeString(String(req.body?.model || req.headers["x-kira-model"] || KIRA_MODEL), 100) || KIRA_MODEL;
-        const newAnalysis = await callKiraChat([
-            { role: "system", content: sanitizeString(String(req.body?.systemPrompt || DEFAULT_ANALYSIS_PROMPT), 5000) || DEFAULT_ANALYSIS_PROMPT },
-            { role: "user", content: `Here is the health log: ${extractedText}` }
-        ], model);
+        let newAnalysis = "";
+        try {
+            newAnalysis = await callKiraChat([
+                { role: "system", content: sanitizeString(String(req.body?.systemPrompt || DEFAULT_ANALYSIS_PROMPT), 5000) || DEFAULT_ANALYSIS_PROMPT },
+                { role: "user", content: `Here is the health log: ${extractedText}` }
+            ], model);
+        } catch (kiraErr) {
+            const msg = String(kiraErr?.message || kiraErr);
+            // Kira wallet empty (402) — graceful, no stack spam. Top up at kiraai.vn.
+            if (/402|insufficient|wallet|balance/i.test(msg)) {
+                console.warn("⚠️ Kira wallet empty — analysis skipped. Top up at kiraai.vn");
+                return res.status(503).json({ success: false, message: "AI analysis unavailable (Kira wallet empty — please top up). Your log is saved.", retryable: true });
+            }
+            throw kiraErr;
+        }
 
-        if (!newAnalysis) return res.status(502).json({ success: false, message: "Kira returned empty" });
+        if (!newAnalysis) return res.status(502).json({ success: false, message: "Kira returned empty", retryable: true });
 
         const safeAnalysis = xss(String(newAnalysis).slice(0, 8000));
         await database.collection(collection).updateOne({ _id: new ObjectId(id) }, { $set: { ai_analysis: safeAnalysis, ai_reanalyzed_at: new Date() } });
