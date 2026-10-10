@@ -1794,21 +1794,31 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
                 console.log(`🤝 webhook ping for ${collection} from ${getClientIp(req)} — ack without save`);
                 return res.json({ success: true, message: "Webhook endpoint active. Send FORM_RESPONSE with data to save." });
             }
-            return res.status(400).json({ success: false, message: "data field required in body {data: ...}" });
+            // Public webhook: never 4xx (prevents Tally retry storms + error-log spam).
+            // Ack 200 with saved:false and log body shape for debugging.
+            console.warn(`⚠️ webhook ${collection} missing data from ${getClientIp(req)} bodyKeys=${Object.keys(req.body || {}).slice(0,8).join(",")} body=${JSON.stringify(req.body).slice(0,500)}`);
+            return res.json({ success: true, saved: false, message: "Webhook endpoint active. No data field — nothing saved.", hint: "Send {data: ...} to save." });
         }
         // Validate data size after sanitization (Tally full payloads with files can be large)
         const rawData = req.body.data;
         // quick size check
         const jsonLen = JSON.stringify(rawData).length;
-        if (jsonLen > 200000) return res.status(400).json({ success: false, message: "data too large (max 200kb stringified)" });
+        if (jsonLen > 200000) {
+            console.warn(`⚠️ webhook ${collection} data too large (${jsonLen}b) from ${getClientIp(req)} — ack without save`);
+            return res.status(413).json({ success: false, saved: false, message: "data too large (max 200kb stringified)" });
+        }
 
         let extractedText = extractNotes(rawData);
         if (!extractedText && req.body.eventType) {
             // Tally test event with empty fields — ack green without saving junk
             console.log(`🤝 empty Tally ${req.body.eventType} for ${collection} from ${getClientIp(req)} — ack without save`);
-            return res.json({ success: true, message: "Webhook endpoint active. Empty test event acknowledged." });
+            return res.json({ success: true, saved: false, message: "Webhook endpoint active. Empty test event acknowledged." });
         }
-        if (!extractedText) return res.status(400).json({ success: false, message: "No extractable notes found" });
+        if (!extractedText) {
+            // Public webhook: ack 200 instead of 400 (Tally stays green, no error-log spam)
+            console.warn(`⚠️ webhook ${collection} no extractable notes from ${getClientIp(req)} dataType=${Array.isArray(rawData) ? "array" : typeof rawData} sample=${JSON.stringify(rawData).slice(0,500)}`);
+            return res.json({ success: true, saved: false, message: "No extractable notes found — nothing saved." });
+        }
 
         // AI disabled for now (Kira wallet empty - 402) — save directly, no tag/analysis calls
         const tagModel = "disabled";
@@ -2346,7 +2356,7 @@ async function start() {
             console.log(`🚀 Secure Dynamic API v2 running on port ${PORT}`);
             console.log(`🔐 Admin panel: http://localhost:${PORT}${normalizedAdminBase}`);
             console.log(`🤖 Kira AI: ${KIRA_BASE_URL} (model: ${KIRA_MODEL})`);
-            console.log(`🛡️  Env: ${NODE_ENV} | CORS: ${CORS_ORIGIN || (isProd ? "DENY" : "open(dev)")} | BodyLimit: 1mb | RateLimit: 60/min | Helmet: on`);
+            console.log(`🛡️  Env: ${NODE_ENV} | CORS: ${CORS_ORIGIN || "open(hobby, reflect-all)"} | BodyLimit: 1mb | RateLimit: 60/min | Helmet: on`);
         });
         // Graceful shutdown
         const shut = async () => {
