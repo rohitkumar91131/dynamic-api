@@ -1710,18 +1710,8 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
     colCheck = normalized;
 
     if (PUBLIC_COLLECTIONS.has(colCheck)) {
-        if (colCheck === "hourlyhealthreport") {
-            const hasKey = req.headers["x-api-key"] || req.headers["authorization"] || req.query.api_key;
-            const isTally = req.body && (req.body.eventType === "FORM_RESPONSE" || req.body.data);
-            if (hasKey) return requireApiKey(req, res, next);
-            if (isTally) return next();
-            console.warn(`⚠️ public POST hourlyhealthreport from ${getClientIp(req)} without key - allowed for Tally`);
-            return next();
-        }
-        // notion_video family - fully open (no auth), rate limited only
-        const hasKey = req.headers["x-api-key"] || req.headers["authorization"] || req.query.api_key;
-        if (hasKey) return requireApiKey(req, res, next);
-        console.warn(`⚠️ public POST ${colCheck} from ${getClientIp(req)} - open mode (notion video)`);
+        // Public webhook collections — fully open, NO token required (Tally sends no key)
+        console.warn(`⚠️ public POST ${colCheck} from ${getClientIp(req)} - open mode, no token`);
         return next();
     }
     return requireApiKey(req, res, next);
