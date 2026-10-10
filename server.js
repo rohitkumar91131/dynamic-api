@@ -547,9 +547,9 @@ async function processOneThumb(database, collection, docId, img, idx) {
         origBuf = await extractVideoFrame(img.url);
         thumbResult = await generateVideoWebpThumbnail(origBuf);
     } else {
-        // Keep the existing fetch path for images/PDF/other files.
+        // Image/PDF/other fetch — 25s budget (Vercel cold fetch to Tally CDN can be slow)
         const controller = new AbortController();
-        const t = setTimeout(()=>controller.abort(), 10000);
+        const t = setTimeout(()=>controller.abort(), 25000);
         try {
             const r = await fetch(img.url, { signal: controller.signal });
             if (!r.ok) throw new Error(`fetch ${r.status}`);
@@ -1853,15 +1853,30 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
         // flag which the retry endpoint / backfill picks up. Frontend uses on-demand
         // /thumb proxy (thumbPending) until background finishes.
         const docIdStr = String(result.insertedId);
+        // Thumbnails INLINE (awaited, 15s budget) — Vercel serverless freezes the
+        // function right after res.json(), so fire-and-forget background tasks get
+        // aborted mid-fetch ("This operation was aborted"). Responding after inline
+        // work guarantees the thumb is saved. On budget-exceed we ack anyway with
+        // thumbPending:true — retry endpoint + on-demand /thumb proxy self-heal.
+        let thumbResults = [];
+        let thumbOk = 0;
         if (thumbCount > 0) {
-            setImmediate(() => {
-                processThumbnailsForDoc(collection, result.insertedId, sanitizedData)
-                    .then(r => {
-                        if (r.processed) console.log(`✅ thumbnails background for ${collection}/${docIdStr}: ok=${r.processed - r.failed} failed=${r.failed}`);
-                        else if (r.failed) console.warn(`⚠️ thumbnails background for ${collection}/${docIdStr}: all failed, retryable via /api/${collection}/${docIdStr}/retry-thumbs`);
-                    })
-                    .catch(e => console.warn(`⚠️ thumbnails background error for ${docIdStr}:`, e.message));
-            });
+            try {
+                const budget = new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 15000));
+                const work = processThumbnailsForDoc(collection, result.insertedId, sanitizedData);
+                const r = await Promise.race([work, budget]);
+                if (r && r.timeout) {
+                    console.warn(`⏳ thumbs budget exceeded for ${collection}/${docIdStr} — ack pending, retry: /api/${collection}/${docIdStr}/retry-thumbs`);
+                    work.then(done => console.log(`✅ late thumbs finished for ${collection}/${docIdStr}: failed=${done.failed}`)).catch(() => {});
+                } else if (r) {
+                    thumbResults = r.results || [];
+                    thumbOk = thumbResults.filter(x => !x.error && !x.skipped).length;
+                    if (r.failed) console.warn(`⚠️ thumbnails inline for ${collection}/${docIdStr}: ok=${thumbOk} failed=${r.failed}, retryable via /api/${collection}/${docIdStr}/retry-thumbs`);
+                    else console.log(`✅ thumbnails inline for ${collection}/${docIdStr}: ok=${thumbOk}`);
+                }
+            } catch (e) {
+                console.warn(`⚠️ thumbnails inline error for ${docIdStr}:`, e.message);
+            }
         }
 
         res.status(201).json({
@@ -1870,10 +1885,10 @@ app.post("/api/:collection", globalLimiter, async (req, res, next) => {
             tags: aiTags,
             ai_analysis: "Skipped (AI disabled)",
             modelUsed: tagModel,
-            thumbnails: [],
-            thumbPending: thumbCount > 0,
+            thumbnails: thumbResults,
+            thumbPending: thumbCount > 0 && thumbOk < thumbCount,
             thumbCount,
-            thumbRetryUrl: thumbCount > 0 ? `/api/${collection}/${docIdStr}/retry-thumbs` : undefined
+            thumbRetryUrl: (thumbCount > 0 && thumbOk < thumbCount) ? `/api/${collection}/${docIdStr}/retry-thumbs` : undefined
         });
     } catch (err) { sendError(res, err, "Failed to create", 500); }
 });

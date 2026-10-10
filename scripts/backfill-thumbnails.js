@@ -108,7 +108,7 @@ async function backfill(limit = 20, collection = "hourlyhealthreport") {
     const candidates = await col.find({
         $and: [
             { "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } } },
-            { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ] }
+            { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] }
         ]
     }).sort({ createdAt: -1 }).limit(limit).toArray();
     console.log(`Found ${candidates.length} docs to backfill (limit ${limit})`);
@@ -141,7 +141,7 @@ async function backfill(limit = 20, collection = "hourlyhealthreport") {
         ok++;
         await new Promise(r=>setTimeout(r, 400));
     }
-    const remaining = await col.countDocuments({ "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } }, $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } } ] });
+    const remaining = await col.countDocuments({ "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } }, $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] });
     console.log(`\n✅ Backfill done: ok=${ok} fail=${fail} remaining=${remaining}`);
     await client.close();
 }
