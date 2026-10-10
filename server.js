@@ -611,7 +611,17 @@ const THUMB_RETRIES = 3; // per-file attempts (one-by-one, backoff between tries
 
 async function processThumbnailsForDoc(collection, docId, data, opts = {}) {
     const images = extractTallyImages(data);
-    if (!images.length) return { processed: 0 };
+    if (!images.length) {
+        // No URLs (empty FILE_UPLOAD) — mark so backfill doesn't re-pick forever
+        try {
+            const database = await getDB();
+            await database.collection(collection).updateOne(
+                { _id: new ObjectId(docId) },
+                { $set: { thumbnails: [], thumbnailAt: new Date(), thumbPending: false, thumbFailed: false, thumbNoFiles: true } }
+            );
+        } catch {}
+        return { processed: 0 };
+    }
     if (!sharp) { console.warn("sharp missing - skip thumbnail for", docId); return { processed: 0, skipped: true }; }
     const database = await getDB();
     // retryOnlyFailed: skip idxs that already have a cached thumb in DB (used by retry endpoint)
@@ -1452,6 +1462,7 @@ app.post(`${normalizedAdminBase}/backfill-thumbnails`, requireAdminAuth, async (
         const pendingFilter = {
             $and: [
                 { "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } } },
+                { thumbNoFiles: { $ne: true } },
                 { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] }
             ]
         };

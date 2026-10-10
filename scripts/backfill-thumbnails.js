@@ -108,6 +108,7 @@ async function backfill(limit = 20, collection = "hourlyhealthreport") {
     const candidates = await col.find({
         $and: [
             { "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } } },
+            { thumbNoFiles: { $ne: true } },
             { $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] }
         ]
     }).sort({ createdAt: -1 }).limit(limit).toArray();
@@ -115,7 +116,12 @@ async function backfill(limit = 20, collection = "hourlyhealthreport") {
     let ok=0, fail=0;
     for (const doc of candidates) {
         const images = extractTallyImages(doc.data);
-        if (!images.length) { console.log(`skip ${doc._id} no images`); continue; }
+        if (!images.length) {
+            console.log(`skip ${doc._id} no images`);
+            // mark done so it isn't re-picked forever (FILE_UPLOAD field exists but no URLs)
+            await col.updateOne({ _id: doc._id }, { $set: { thumbnails: [], thumbnailAt: new Date(), thumbPending: false, thumbFailed: false, thumbNoFiles: true } });
+            continue;
+        }
         console.log(`\nProcessing ${doc._id} (${images.length} files) ...`);
         const results = [];
         for (let idx=0; idx < images.length; idx++) {
@@ -141,7 +147,7 @@ async function backfill(limit = 20, collection = "hourlyhealthreport") {
         ok++;
         await new Promise(r=>setTimeout(r, 400));
     }
-    const remaining = await col.countDocuments({ "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } }, $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] });
+    const remaining = await col.countDocuments({ "data.fields": { $elemMatch: { type: "FILE_UPLOAD" } }, thumbNoFiles: { $ne: true }, $or: [ { thumbnails: { $exists: false } }, { thumbnails: { $size: 0 } }, { thumbnailAt: { $exists: false } }, { thumbFailed: true }, { thumbPending: true } ] });
     console.log(`\n✅ Backfill done: ok=${ok} fail=${fail} remaining=${remaining}`);
     await client.close();
 }
